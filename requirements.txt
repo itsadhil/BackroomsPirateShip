@@ -1,0 +1,6 @@
+discord.py>=2.4.0
+aiohttp
+python-dotenv
+beautifulsoup4
+playwright
+feedparser

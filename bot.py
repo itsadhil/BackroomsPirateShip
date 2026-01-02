@@ -58,6 +58,10 @@ bot.game_tags = {}  # Track game tags (thread_id: [tags])
 bot.link_health = {}  # Track link health (thread_id: {checked_at, status, broken_links})
 bot.trending_views = {}  # Track thread views for trending (thread_id: view_count)
 bot.webhooks = {}  # Track webhook URLs (user_id: webhook_url)
+bot.collections = {}  # Track user collections (user_id: {collection_name: [thread_ids]})
+bot.bookmarks = {}  # Track user bookmarks (user_id: [thread_ids])
+bot.compatibility_reports = {}  # Track compatibility reports (thread_id: [{user_id, status, specs, notes}])
+bot.user_preferences = {}  # Track user genre preferences for recommendations (user_id: {genres, playtime})
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -72,6 +76,8 @@ REVIEWS_FILE = "reviews_data.json"
 TAGS_FILE = "tags_data.json"
 HEALTH_FILE = "link_health_data.json"
 WEBHOOKS_FILE = "webhooks_data.json"
+COLLECTIONS_FILE = "collections_data.json"
+COMPATIBILITY_FILE = "compatibility_data.json"
 
 # Load previously seen posts
 def load_seen_posts():
@@ -128,6 +134,8 @@ def load_user_data():
                 bot.game_notifications = data.get('game_notifications', {})
                 bot.request_votes = {int(k): v for k, v in data.get('request_votes', {}).items()}
                 bot.trending_views = {int(k): v for k, v in data.get('trending_views', {}).items()}
+                bot.bookmarks = {int(k): v for k, v in data.get('bookmarks', {}).items()}
+                bot.user_preferences = {int(k): v for k, v in data.get('user_preferences', {}).items()}
                 print(f"✅ Loaded user data (Libraries: {len(bot.user_libraries)}, Notifications: {len(bot.game_notifications)})")
     except Exception as e:
         print(f"⚠️ Could not load user data: {e}")
@@ -141,6 +149,8 @@ def save_user_data():
             'game_notifications': bot.game_notifications,
             'request_votes': {str(k): v for k, v in bot.request_votes.items()},
             'trending_views': {str(k): v for k, v in bot.trending_views.items()},
+            'bookmarks': {str(k): v for k, v in bot.bookmarks.items()},
+            'user_preferences': {str(k): v for k, v in bot.user_preferences.items()},
             'last_updated': discord.utils.utcnow().isoformat()
         }
         with open(USER_DATA_FILE, 'w') as f:
@@ -219,6 +229,42 @@ def save_webhooks_data():
             json.dump({str(k): v for k, v in bot.webhooks.items()}, f, indent=2)
     except Exception as e:
         print(f"⚠️ Could not save webhooks data: {e}")
+
+def load_collections_data():
+    """Load collections data."""
+    try:
+        if os.path.exists(COLLECTIONS_FILE):
+            with open(COLLECTIONS_FILE, 'r') as f:
+                bot.collections = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded collections for {len(bot.collections)} users")
+    except Exception as e:
+        print(f"⚠️ Could not load collections data: {e}")
+
+def save_collections_data():
+    """Save collections data."""
+    try:
+        with open(COLLECTIONS_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.collections.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save collections data: {e}")
+
+def load_compatibility_data():
+    """Load compatibility data."""
+    try:
+        if os.path.exists(COMPATIBILITY_FILE):
+            with open(COMPATIBILITY_FILE, 'r') as f:
+                bot.compatibility_reports = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded compatibility reports for {len(bot.compatibility_reports)} games")
+    except Exception as e:
+        print(f"⚠️ Could not load compatibility data: {e}")
+
+def save_compatibility_data():
+    """Save compatibility data."""
+    try:
+        with open(COMPATIBILITY_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.compatibility_reports.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save compatibility data: {e}")
 
 async def update_status_message(status: str):
     """Update or create the bot status message."""
@@ -998,6 +1044,8 @@ async def on_ready():
     load_tags_data()
     load_health_data()
     load_webhooks_data()
+    load_collections_data()
+    load_compatibility_data()
     
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
@@ -1052,6 +1100,8 @@ async def on_close():
     save_tags_data()
     save_health_data()
     save_webhooks_data()
+    save_collections_data()
+    save_compatibility_data()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -5056,6 +5106,452 @@ async def removewebhook(interaction: discord.Interaction):
             await interaction.followup.send("❌ You don't have a webhook configured.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+# -------------------------
+# NEW FEATURES - COLLECTIONS
+# -------------------------
+@bot.tree.command(name="createcollection", description="Create a game collection")
+@discord.app_commands.describe(name="Name of the collection (e.g., 'Horror Games', 'Co-op')")
+async def createcollection(interaction: discord.Interaction, name: str):
+    """Create a new game collection."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if interaction.user.id not in bot.collections:
+            bot.collections[interaction.user.id] = {}
+        
+        if name in bot.collections[interaction.user.id]:
+            await interaction.followup.send(f"❌ You already have a collection named '{name}'", ephemeral=True)
+            return
+        
+        bot.collections[interaction.user.id][name] = []
+        save_collections_data()
+        
+        await interaction.followup.send(f"✅ Collection **{name}** created! Add games with `/addtocollection`", ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="addtocollection", description="Add a game to your collection")
+@discord.app_commands.describe(
+    collection="Name of your collection",
+    game="Name of the game to add"
+)
+async def addtocollection(interaction: discord.Interaction, collection: str, game: str):
+    """Add a game to a collection."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if interaction.user.id not in bot.collections or collection not in bot.collections[interaction.user.id]:
+            await interaction.followup.send(f"❌ Collection '{collection}' not found. Create it first with `/createcollection`", ephemeral=True)
+            return
+        
+        # Find game thread
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find game matching '{game}'", ephemeral=True)
+            return
+        
+        if found_thread.id in bot.collections[interaction.user.id][collection]:
+            await interaction.followup.send(f"❌ **{found_thread.name}** is already in collection '{collection}'", ephemeral=True)
+            return
+        
+        bot.collections[interaction.user.id][collection].append(found_thread.id)
+        save_collections_data()
+        
+        await interaction.followup.send(f"✅ Added **{found_thread.name}** to collection **{collection}**", ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="mycollections", description="View your game collections")
+async def mycollections(interaction: discord.Interaction):
+    """View all user collections."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if interaction.user.id not in bot.collections or not bot.collections[interaction.user.id]:
+            await interaction.followup.send("📚 You don't have any collections yet. Create one with `/createcollection`", ephemeral=True)
+            return
+        
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        
+        embed = discord.Embed(
+            title=f"📚 {interaction.user.display_name}'s Collections",
+            color=discord.Color.purple()
+        )
+        
+        for collection_name, thread_ids in bot.collections[interaction.user.id].items():
+            if thread_ids:
+                games_text = []
+                for thread_id in thread_ids[:5]:
+                    try:
+                        thread = await output_channel.fetch_channel(thread_id)
+                        games_text.append(f"• {thread.mention}")
+                    except:
+                        pass
+                
+                if len(thread_ids) > 5:
+                    games_text.append(f"... and {len(thread_ids) - 5} more")
+                
+                embed.add_field(
+                    name=f"{collection_name} ({len(thread_ids)} games)",
+                    value="\n".join(games_text) if games_text else "Empty",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"{collection_name}",
+                    value="*Empty*",
+                    inline=False
+                )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+# -------------------------
+# NEW FEATURES - BOOKMARKS
+# -------------------------
+@bot.tree.command(name="bookmark", description="Bookmark a game for later")
+@discord.app_commands.describe(game="Name of the game to bookmark")
+async def bookmark(interaction: discord.Interaction, game: str):
+    """Bookmark a game."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find game matching '{game}'", ephemeral=True)
+            return
+        
+        if interaction.user.id not in bot.bookmarks:
+            bot.bookmarks[interaction.user.id] = []
+        
+        if found_thread.id in bot.bookmarks[interaction.user.id]:
+            await interaction.followup.send(f"❌ **{found_thread.name}** is already bookmarked", ephemeral=True)
+            return
+        
+        bot.bookmarks[interaction.user.id].append(found_thread.id)
+        save_user_data()
+        
+        await interaction.followup.send(f"🔖 Bookmarked **{found_thread.name}**!", ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="bookmarks", description="View your bookmarked games")
+async def bookmarks_cmd(interaction: discord.Interaction):
+    """View all bookmarks."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if interaction.user.id not in bot.bookmarks or not bot.bookmarks[interaction.user.id]:
+            await interaction.followup.send("🔖 You don't have any bookmarks yet. Bookmark games with `/bookmark`", ephemeral=True)
+            return
+        
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        
+        embed = discord.Embed(
+            title=f"🔖 {interaction.user.display_name}'s Bookmarks",
+            description=f"{len(bot.bookmarks[interaction.user.id])} bookmarked games",
+            color=discord.Color.gold()
+        )
+        
+        for thread_id in bot.bookmarks[interaction.user.id][:25]:
+            try:
+                thread = await output_channel.fetch_channel(thread_id)
+                
+                # Get rating if available
+                reviews = bot.game_reviews.get(thread_id, [])
+                rating_str = ""
+                if reviews:
+                    avg = sum(r['rating'] for r in reviews) / len(reviews)
+                    rating_str = f" | {avg:.1f}⭐"
+                
+                embed.add_field(
+                    name=thread.name,
+                    value=f"{thread.mention}{rating_str}",
+                    inline=False
+                )
+            except:
+                pass
+        
+        if len(bot.bookmarks[interaction.user.id]) > 25:
+            embed.set_footer(text=f"Showing 25 of {len(bot.bookmarks[interaction.user.id])} bookmarks")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+# -------------------------
+# NEW FEATURES - COMPATIBILITY REPORTS
+# -------------------------
+@bot.tree.command(name="reportcompat", description="Report game compatibility")
+@discord.app_commands.describe(
+    game="Name of the game",
+    status="Does it work?",
+    specs="Your PC specs (optional)",
+    notes="Additional notes (optional)"
+)
+@discord.app_commands.choices(status=[
+    discord.app_commands.Choice(name="✅ Working", value="working"),
+    discord.app_commands.Choice(name="⚠️ Issues", value="issues"),
+    discord.app_commands.Choice(name="❌ Broken", value="broken")
+])
+async def reportcompat(interaction: discord.Interaction, game: str, status: discord.app_commands.Choice[str], specs: str = None, notes: str = None):
+    """Report game compatibility."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find game matching '{game}'", ephemeral=True)
+            return
+        
+        thread_id = found_thread.id
+        
+        if thread_id not in bot.compatibility_reports:
+            bot.compatibility_reports[thread_id] = []
+        
+        # Check if user already reported
+        existing_idx = None
+        for idx, report in enumerate(bot.compatibility_reports[thread_id]):
+            if report['user_id'] == interaction.user.id:
+                existing_idx = idx
+                break
+        
+        report_entry = {
+            'user_id': interaction.user.id,
+            'username': str(interaction.user),
+            'status': status.value,
+            'specs': specs,
+            'notes': notes,
+            'timestamp': discord.utils.utcnow().isoformat()
+        }
+        
+        if existing_idx is not None:
+            bot.compatibility_reports[thread_id][existing_idx] = report_entry
+            action = "updated"
+        else:
+            bot.compatibility_reports[thread_id].append(report_entry)
+            action = "added"
+        
+        save_compatibility_data()
+        
+        status_emoji = {"working": "✅", "issues": "⚠️", "broken": "❌"}[status.value]
+        
+        await interaction.followup.send(
+            f"{status_emoji} Compatibility report {action} for **{found_thread.name}**!",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="compatibility", description="View compatibility reports for a game")
+@discord.app_commands.describe(game="Name of the game")
+async def compatibility(interaction: discord.Interaction, game: str):
+    """View compatibility reports."""
+    await interaction.response.defer()
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find game matching '{game}'")
+            return
+        
+        reports = bot.compatibility_reports.get(found_thread.id, [])
+        
+        if not reports:
+            await interaction.followup.send(f"📊 No compatibility reports yet for **{found_thread.name}**.\nBe the first to report using `/reportcompat`!")
+            return
+        
+        # Count statuses
+        working = sum(1 for r in reports if r['status'] == 'working')
+        issues = sum(1 for r in reports if r['status'] == 'issues')
+        broken = sum(1 for r in reports if r['status'] == 'broken')
+        
+        embed = discord.Embed(
+            title=f"📊 Compatibility: {found_thread.name}",
+            description=f"**{working}** ✅ Working | **{issues}** ⚠️ Issues | **{broken}** ❌ Broken",
+            color=discord.Color.blue()
+        )
+        
+        # Show recent reports
+        for report in sorted(reports, key=lambda x: x['timestamp'], reverse=True)[:10]:
+            status_emoji = {"working": "✅", "issues": "⚠️", "broken": "❌"}[report['status']]
+            
+            value_parts = []
+            if report.get('specs'):
+                value_parts.append(f"**Specs:** {report['specs'][:100]}")
+            if report.get('notes'):
+                value_parts.append(f"**Notes:** {report['notes'][:100]}")
+            if not value_parts:
+                value_parts.append("*No additional details*")
+            
+            embed.add_field(
+                name=f"{status_emoji} {report['username']}",
+                value="\n".join(value_parts),
+                inline=False
+            )
+        
+        if len(reports) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(reports)} reports")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - RECOMMENDATIONS
+# -------------------------
+@bot.tree.command(name="recommend", description="Get personalized game recommendations")
+async def recommend(interaction: discord.Interaction):
+    """Get personalized recommendations based on user library."""
+    await interaction.response.defer()
+    
+    try:
+        if interaction.user.id not in bot.user_libraries or not bot.user_libraries[interaction.user.id]:
+            await interaction.followup.send("❌ You need to add games to your library first (📚 reaction) to get recommendations!")
+            return
+        
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        
+        # Analyze user's library genres
+        user_genres = {}
+        for thread_id in bot.user_libraries[interaction.user.id]:
+            tags = bot.game_tags.get(thread_id, [])
+            for tag in tags:
+                user_genres[tag] = user_genres.get(tag, 0) + 1
+        
+        if not user_genres:
+            await interaction.followup.send("❌ Not enough data for recommendations. Try adding tags to your library games!")
+            return
+        
+        # Find games with matching genres that user doesn't have
+        recommendations = []
+        for thread_id, tags in bot.game_tags.items():
+            if thread_id not in bot.user_libraries[interaction.user.id]:
+                score = sum(user_genres.get(tag, 0) for tag in tags)
+                if score > 0:
+                    recommendations.append((thread_id, score, tags))
+        
+        if not recommendations:
+            await interaction.followup.send("📊 No recommendations available yet. Try adding more games or tags!")
+            return
+        
+        # Sort by score
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+        
+        embed = discord.Embed(
+            title=f"🎯 Recommendations for {interaction.user.display_name}",
+            description=f"Based on your library of {len(bot.user_libraries[interaction.user.id])} games",
+            color=discord.Color.purple()
+        )
+        
+        for thread_id, score, tags in recommendations[:10]:
+            try:
+                thread = await output_channel.fetch_channel(thread_id)
+                
+                # Get rating
+                reviews = bot.game_reviews.get(thread_id, [])
+                rating_str = ""
+                if reviews:
+                    avg = sum(r['rating'] for r in reviews) / len(reviews)
+                    rating_str = f" | {avg:.1f}⭐"
+                
+                tags_str = ", ".join(tags[:3])
+                
+                embed.add_field(
+                    name=thread.name,
+                    value=f"{thread.mention}\nTags: {tags_str}{rating_str}",
+                    inline=False
+                )
+            except:
+                pass
+        
+        embed.set_footer(text="Recommendations based on genres in your library")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
 
 # -------------------------
 # RUN

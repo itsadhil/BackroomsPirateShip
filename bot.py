@@ -1970,6 +1970,44 @@ class FitGirlSearchView(discord.ui.View):
                 await interaction.delete_original_response()
                 return
             
+            # Check if it's a paste site (can download) or direct link (just post link)
+            is_paste_site = 'paste' in paste_url.lower()
+            
+            if not is_paste_site:
+                # It's a direct link (like sendfile.su), post as link instead
+                await interaction.followup.send(
+                    f"📎 Direct link detected! Posting game with link...",
+                    ephemeral=True
+                )
+                
+                # Create the game submission with link
+                version = None
+                notes = details.get('repack_size', '')
+                if details.get('languages'):
+                    notes = f"Languages: {details['languages']}\n" + notes
+                
+                # Process as link-based submission
+                await process_game_submission(
+                    interaction=interaction,
+                    game_name=game_name,
+                    version=version,
+                    game_links=paste_url,  # Use torrent link as game link
+                    notes=notes,
+                    torrent_link=paste_url,  # Also set as torrent link
+                    channel_id=OUTPUT_CHANNEL_ID,
+                    user=interaction.user,
+                    fitgirl_url=current['url'],
+                    details=details
+                )
+                
+                await asyncio.sleep(10)
+                try:
+                    await interaction.delete_original_response()
+                except:
+                    pass
+                return
+            
+            # It's a paste site, proceed with download
             # Create unique request ID
             request_id = f"{interaction.user.id}_{int(discord.utils.utcnow().timestamp())}"
             

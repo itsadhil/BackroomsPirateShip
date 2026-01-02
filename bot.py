@@ -53,6 +53,10 @@ bot.download_stats = {}  # Track download counts per game (thread_id: count)
 bot.user_libraries = {}  # Track user game libraries (user_id: [thread_ids])
 bot.game_notifications = {}  # Track notification requests (game_name: [user_ids])
 bot.request_votes = {}  # Track votes on requests (message_id: [user_ids])
+bot.game_reviews = {}  # Track game reviews (thread_id: [{user_id, rating, review, timestamp}])
+bot.game_tags = {}  # Track game tags (thread_id: [tags])
+bot.link_health = {}  # Track link health (thread_id: {checked_at, status, broken_links})
+bot.trending_views = {}  # Track thread views for trending (thread_id: view_count)
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -63,6 +67,9 @@ bot.queue_position = {}  # Track position in queue for users
 RSS_SEEN_FILE = "fitgirl_seen_posts.json"
 BOT_STATE_FILE = "bot_state.json"
 USER_DATA_FILE = "user_data.json"
+REVIEWS_FILE = "reviews_data.json"
+TAGS_FILE = "tags_data.json"
+HEALTH_FILE = "link_health_data.json"
 
 # Load previously seen posts
 def load_seen_posts():
@@ -118,6 +125,7 @@ def load_user_data():
                 bot.user_libraries = {int(k): v for k, v in data.get('user_libraries', {}).items()}
                 bot.game_notifications = data.get('game_notifications', {})
                 bot.request_votes = {int(k): v for k, v in data.get('request_votes', {}).items()}
+                bot.trending_views = {int(k): v for k, v in data.get('trending_views', {}).items()}
                 print(f"✅ Loaded user data (Libraries: {len(bot.user_libraries)}, Notifications: {len(bot.game_notifications)})")
     except Exception as e:
         print(f"⚠️ Could not load user data: {e}")
@@ -130,12 +138,67 @@ def save_user_data():
             'user_libraries': {str(k): v for k, v in bot.user_libraries.items()},
             'game_notifications': bot.game_notifications,
             'request_votes': {str(k): v for k, v in bot.request_votes.items()},
+            'trending_views': {str(k): v for k, v in bot.trending_views.items()},
             'last_updated': discord.utils.utcnow().isoformat()
         }
         with open(USER_DATA_FILE, 'w') as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         print(f"⚠️ Could not save user data: {e}")
+
+def load_reviews_data():
+    """Load review data."""
+    try:
+        if os.path.exists(REVIEWS_FILE):
+            with open(REVIEWS_FILE, 'r') as f:
+                bot.game_reviews = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded {len(bot.game_reviews)} game reviews")
+    except Exception as e:
+        print(f"⚠️ Could not load reviews data: {e}")
+
+def save_reviews_data():
+    """Save review data."""
+    try:
+        with open(REVIEWS_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.game_reviews.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save reviews data: {e}")
+
+def load_tags_data():
+    """Load tags data."""
+    try:
+        if os.path.exists(TAGS_FILE):
+            with open(TAGS_FILE, 'r') as f:
+                bot.game_tags = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded tags for {len(bot.game_tags)} games")
+    except Exception as e:
+        print(f"⚠️ Could not load tags data: {e}")
+
+def save_tags_data():
+    """Save tags data."""
+    try:
+        with open(TAGS_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.game_tags.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save tags data: {e}")
+
+def load_health_data():
+    """Load link health data."""
+    try:
+        if os.path.exists(HEALTH_FILE):
+            with open(HEALTH_FILE, 'r') as f:
+                bot.link_health = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded health data for {len(bot.link_health)} games")
+    except Exception as e:
+        print(f"⚠️ Could not load health data: {e}")
+
+def save_health_data():
+    """Save link health data."""
+    try:
+        with open(HEALTH_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.link_health.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save health data: {e}")
 
 async def update_status_message(status: str):
     """Update or create the bot status message."""
@@ -858,6 +921,9 @@ async def on_ready():
     load_seen_posts()
     load_bot_state()
     load_user_data()
+    load_reviews_data()
+    load_tags_data()
+    load_health_data()
     
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
@@ -882,6 +948,11 @@ async def on_ready():
         update_dashboard.start()
         print(f"✅ Dashboard updater started")
     
+    # Start link health monitor
+    if not link_health_monitor.is_running():
+        link_health_monitor.start()
+        print(f"✅ Link health monitor started (checks daily)")
+    
     # Start Playwright queue processor
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
@@ -898,6 +969,9 @@ async def on_close():
     save_seen_posts()
     save_bot_state()
     save_user_data()
+    save_reviews_data()
+    save_tags_data()
+    save_health_data()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -1312,6 +1386,74 @@ async def update_dashboard():
 
 @update_dashboard.before_loop
 async def before_dashboard():
+    await bot.wait_until_ready()
+
+# =========================================================
+# LINK HEALTH MONITOR
+# =========================================================
+@tasks.loop(hours=24)  # Check link health daily
+async def link_health_monitor():
+    """Monitor download links and update health status."""
+    try:
+        print("🔍 Starting link health check...")
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            return
+        
+        checked_count = 0
+        broken_count = 0
+        
+        # Check active threads
+        for thread in output_channel.threads:
+            try:
+                # Get the first message (post content)
+                async for message in thread.history(limit=1, oldest_first=True):
+                    if message.embeds:
+                        embed = message.embeds[0]
+                        
+                        # Extract links from embed description
+                        description = embed.description or ""
+                        links = re.findall(r'https?://[^\s\)]+', description)
+                        
+                        # Check each link
+                        broken_links = []
+                        for link in links:
+                            try:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.head(link, timeout=10, allow_redirects=True) as resp:
+                                        if resp.status >= 400:
+                                            broken_links.append(link)
+                            except:
+                                broken_links.append(link)
+                        
+                        # Update health data
+                        health_status = "healthy" if not broken_links else "broken"
+                        bot.link_health[thread.id] = {
+                            'checked_at': discord.utils.utcnow().isoformat(),
+                            'status': health_status,
+                            'broken_links': broken_links,
+                            'total_links': len(links)
+                        }
+                        
+                        checked_count += 1
+                        if broken_links:
+                            broken_count += 1
+                            print(f"⚠️ Found {len(broken_links)} broken links in: {thread.name}")
+                
+                # Rate limiting
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                print(f"⚠️ Error checking thread {thread.name}: {e}")
+        
+        save_health_data()
+        print(f"✅ Link health check complete: {checked_count} checked, {broken_count} with broken links")
+        
+    except Exception as e:
+        print(f"⚠️ Error in link health monitor: {e}")
+
+@link_health_monitor.before_loop
+async def before_health_monitor():
     await bot.wait_until_ready()
 
 # =========================================================
@@ -3857,6 +3999,604 @@ async def downloadstats(interaction: discord.Interaction):
     embed.set_footer(text="Download count tracked from button clicks")
     
     await interaction.followup.send(embed=embed)
+
+# -------------------------
+# NEW FEATURES - REVIEWS & RATINGS
+# -------------------------
+@bot.tree.command(name="review", description="Write a review for a game")
+@discord.app_commands.describe(
+    game="Name of the game to review",
+    rating="Rating from 1 to 5 stars",
+    review_text="Your review text (optional)"
+)
+@discord.app_commands.choices(rating=[
+    discord.app_commands.Choice(name="⭐ 1 Star", value=1),
+    discord.app_commands.Choice(name="⭐⭐ 2 Stars", value=2),
+    discord.app_commands.Choice(name="⭐⭐⭐ 3 Stars", value=3),
+    discord.app_commands.Choice(name="⭐⭐⭐⭐ 4 Stars", value=4),
+    discord.app_commands.Choice(name="⭐⭐⭐⭐⭐ 5 Stars", value=5)
+])
+async def review(interaction: discord.Interaction, game: str, rating: discord.app_commands.Choice[int], review_text: str = None):
+    """Allow users to review and rate games."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Search for the game thread
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        # Check active threads
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        # Check archived if not found
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find a game matching '{game}'", ephemeral=True)
+            return
+        
+        thread_id = found_thread.id
+        
+        # Initialize reviews for this game if not exists
+        if thread_id not in bot.game_reviews:
+            bot.game_reviews[thread_id] = []
+        
+        # Check if user already reviewed this game
+        existing_review_idx = None
+        for idx, rev in enumerate(bot.game_reviews[thread_id]):
+            if rev['user_id'] == interaction.user.id:
+                existing_review_idx = idx
+                break
+        
+        # Create review entry
+        review_entry = {
+            'user_id': interaction.user.id,
+            'username': str(interaction.user),
+            'rating': rating.value,
+            'review': review_text,
+            'timestamp': discord.utils.utcnow().isoformat()
+        }
+        
+        # Update or add review
+        if existing_review_idx is not None:
+            bot.game_reviews[thread_id][existing_review_idx] = review_entry
+            action = "updated"
+        else:
+            bot.game_reviews[thread_id].append(review_entry)
+            action = "added"
+        
+        save_reviews_data()
+        
+        # Calculate average rating
+        ratings = [r['rating'] for r in bot.game_reviews[thread_id]]
+        avg_rating = sum(ratings) / len(ratings)
+        stars = "⭐" * rating.value
+        
+        embed = discord.Embed(
+            title=f"✅ Review {action}!",
+            description=f"Your review for **{found_thread.name}** has been {action}",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Your Rating", value=stars, inline=True)
+        embed.add_field(name="Average Rating", value=f"{avg_rating:.1f}/5.0 ⭐ ({len(ratings)} reviews)", inline=True)
+        if review_text:
+            embed.add_field(name="Your Review", value=review_text[:1024], inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="reviews", description="View reviews for a game")
+@discord.app_commands.describe(game="Name of the game to see reviews for")
+async def reviews(interaction: discord.Interaction, game: str):
+    """View all reviews for a specific game."""
+    await interaction.response.defer()
+    
+    try:
+        # Search for the game thread
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        # Check active threads
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        # Check archived if not found
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find a game matching '{game}'")
+            return
+        
+        thread_id = found_thread.id
+        
+        # Get reviews
+        reviews_list = bot.game_reviews.get(thread_id, [])
+        
+        if not reviews_list:
+            await interaction.followup.send(f"📝 No reviews yet for **{found_thread.name}**.\nBe the first to review using `/review`!")
+            return
+        
+        # Calculate average rating
+        ratings = [r['rating'] for r in reviews_list]
+        avg_rating = sum(ratings) / len(ratings)
+        
+        embed = discord.Embed(
+            title=f"📝 Reviews for {found_thread.name}",
+            description=f"**{avg_rating:.1f}/5.0** ⭐ ({len(reviews_list)} reviews)",
+            color=discord.Color.blue()
+        )
+        
+        # Show up to 10 most recent reviews
+        for review in sorted(reviews_list, key=lambda x: x['timestamp'], reverse=True)[:10]:
+            stars = "⭐" * review['rating']
+            review_text = review.get('review', '*No written review*')
+            if review_text and len(review_text) > 100:
+                review_text = review_text[:97] + "..."
+            
+            embed.add_field(
+                name=f"{review['username']} - {stars}",
+                value=review_text or "*No written review*",
+                inline=False
+            )
+        
+        if len(reviews_list) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(reviews_list)} reviews")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - TAGS & CATEGORIES
+# -------------------------
+@bot.tree.command(name="addtag", description="Add tags to a game (Admin only)")
+@discord.app_commands.describe(
+    game="Name of the game",
+    tags="Comma-separated tags (e.g., Horror, Multiplayer, Co-op)"
+)
+async def addtag(interaction: discord.Interaction, game: str, tags: str):
+    """Add tags to a game (admin only)."""
+    # Check if user has admin role
+    if ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+        await interaction.response.send_message("❌ You need admin role to add tags", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Search for the game thread
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        found_thread = None
+        search_lower = game.lower()
+        
+        # Check active threads
+        for thread in output_channel.threads:
+            if search_lower in thread.name.lower():
+                found_thread = thread
+                break
+        
+        # Check archived if not found
+        if not found_thread:
+            async for thread in output_channel.archived_threads(limit=200):
+                if search_lower in thread.name.lower():
+                    found_thread = thread
+                    break
+        
+        if not found_thread:
+            await interaction.followup.send(f"❌ Could not find a game matching '{game}'", ephemeral=True)
+            return
+        
+        thread_id = found_thread.id
+        
+        # Parse tags
+        tag_list = [tag.strip() for tag in tags.split(',')]
+        
+        # Initialize or update tags
+        if thread_id not in bot.game_tags:
+            bot.game_tags[thread_id] = []
+        
+        # Add new tags (avoid duplicates)
+        for tag in tag_list:
+            if tag and tag not in bot.game_tags[thread_id]:
+                bot.game_tags[thread_id].append(tag)
+        
+        save_tags_data()
+        
+        embed = discord.Embed(
+            title="✅ Tags Added",
+            description=f"Tags updated for **{found_thread.name}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="All Tags", value=", ".join(bot.game_tags[thread_id]), inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="tags", description="Search games by tags")
+@discord.app_commands.describe(tag="Tag to search for (e.g., Horror, RPG, Multiplayer)")
+async def tags(interaction: discord.Interaction, tag: str):
+    """Search for games by tag."""
+    await interaction.response.defer()
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        # Find games with matching tag
+        matching_games = []
+        tag_lower = tag.lower()
+        
+        for thread_id, tags_list in bot.game_tags.items():
+            if any(tag_lower in t.lower() for t in tags_list):
+                try:
+                    thread = await output_channel.fetch_channel(thread_id)
+                    if thread:
+                        matching_games.append({
+                            'thread': thread,
+                            'tags': tags_list
+                        })
+                except:
+                    pass
+        
+        if not matching_games:
+            await interaction.followup.send(f"❌ No games found with tag '{tag}'")
+            return
+        
+        embed = discord.Embed(
+            title=f"🏷️ Games tagged: {tag}",
+            description=f"Found {len(matching_games)} games",
+            color=discord.Color.blue()
+        )
+        
+        # Show up to 15 games
+        for game_info in matching_games[:15]:
+            thread = game_info['thread']
+            tags_str = ", ".join(game_info['tags'])
+            
+            # Get rating if available
+            reviews = bot.game_reviews.get(thread.id, [])
+            if reviews:
+                avg_rating = sum(r['rating'] for r in reviews) / len(reviews)
+                rating_str = f" | {avg_rating:.1f}⭐"
+            else:
+                rating_str = ""
+            
+            embed.add_field(
+                name=thread.name,
+                value=f"{thread.mention} | Tags: {tags_str}{rating_str}",
+                inline=False
+            )
+        
+        if len(matching_games) > 15:
+            embed.set_footer(text=f"Showing 15 of {len(matching_games)} games")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - TRENDING
+# -------------------------
+@bot.tree.command(name="trending", description="Show trending games based on activity")
+async def trending(interaction: discord.Interaction):
+    """Show trending games based on recent activity."""
+    await interaction.response.defer()
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        # Combine download stats and library adds for trending score
+        trending_scores = {}
+        
+        # Factor 1: Download counts (heavily weighted)
+        for thread_id, count in bot.download_stats.items():
+            trending_scores[thread_id] = count * 3
+        
+        # Factor 2: Library additions (moderately weighted)
+        for user_id, library in bot.user_libraries.items():
+            for thread_id in library:
+                trending_scores[thread_id] = trending_scores.get(thread_id, 0) + 2
+        
+        # Factor 3: Reviews (lightly weighted)
+        for thread_id, reviews in bot.game_reviews.items():
+            trending_scores[thread_id] = trending_scores.get(thread_id, 0) + len(reviews)
+        
+        if not trending_scores:
+            await interaction.followup.send("📊 No trending data available yet")
+            return
+        
+        # Sort by score
+        sorted_trending = sorted(trending_scores.items(), key=lambda x: x[1], reverse=True)[:15]
+        
+        embed = discord.Embed(
+            title="🔥 Trending Games",
+            description="Based on downloads, library adds, and reviews",
+            color=discord.Color.orange()
+        )
+        
+        for idx, (thread_id, score) in enumerate(sorted_trending, 1):
+            try:
+                thread = await output_channel.fetch_channel(thread_id)
+                if thread:
+                    # Get additional info
+                    downloads = bot.download_stats.get(thread_id, 0)
+                    reviews = bot.game_reviews.get(thread_id, [])
+                    avg_rating = ""
+                    if reviews:
+                        avg = sum(r['rating'] for r in reviews) / len(reviews)
+                        avg_rating = f" | {avg:.1f}⭐"
+                    
+                    embed.add_field(
+                        name=f"#{idx} {thread.name}",
+                        value=f"{thread.mention} | {downloads} downloads{avg_rating}",
+                        inline=False
+                    )
+            except:
+                pass
+        
+        embed.set_footer(text="Trending score = downloads×3 + library adds×2 + reviews")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - ADVANCED SEARCH
+# -------------------------
+@bot.tree.command(name="advancedsearch", description="Advanced search with filters")
+@discord.app_commands.describe(
+    query="Search query",
+    min_rating="Minimum rating (1-5)",
+    tag="Filter by tag",
+    sort="Sort results"
+)
+@discord.app_commands.choices(sort=[
+    discord.app_commands.Choice(name="Relevance", value="relevance"),
+    discord.app_commands.Choice(name="Rating (High to Low)", value="rating_desc"),
+    discord.app_commands.Choice(name="Rating (Low to High)", value="rating_asc"),
+    discord.app_commands.Choice(name="Most Downloaded", value="downloads"),
+    discord.app_commands.Choice(name="Newest", value="newest")
+])
+async def advancedsearch(
+    interaction: discord.Interaction,
+    query: str,
+    min_rating: int = None,
+    tag: str = None,
+    sort: discord.app_commands.Choice[str] = None
+):
+    """Advanced search with multiple filters."""
+    await interaction.response.defer()
+    
+    try:
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        # Collect all matching games
+        matching_games = []
+        query_lower = query.lower()
+        
+        # Search active threads
+        for thread in output_channel.threads:
+            if query_lower in thread.name.lower():
+                matching_games.append(thread)
+        
+        # Search archived threads
+        async for thread in output_channel.archived_threads(limit=100):
+            if query_lower in thread.name.lower():
+                matching_games.append(thread)
+        
+        if not matching_games:
+            await interaction.followup.send(f"❌ No games found matching '{query}'")
+            return
+        
+        # Apply filters and collect data
+        filtered_games = []
+        for thread in matching_games:
+            thread_id = thread.id
+            
+            # Get reviews/rating
+            reviews = bot.game_reviews.get(thread_id, [])
+            avg_rating = sum(r['rating'] for r in reviews) / len(reviews) if reviews else 0
+            
+            # Filter by minimum rating
+            if min_rating and avg_rating < min_rating:
+                continue
+            
+            # Filter by tag
+            if tag:
+                thread_tags = bot.game_tags.get(thread_id, [])
+                if not any(tag.lower() in t.lower() for t in thread_tags):
+                    continue
+            
+            # Collect data for sorting
+            filtered_games.append({
+                'thread': thread,
+                'rating': avg_rating,
+                'reviews_count': len(reviews),
+                'downloads': bot.download_stats.get(thread_id, 0),
+                'tags': bot.game_tags.get(thread_id, [])
+            })
+        
+        if not filtered_games:
+            await interaction.followup.send("❌ No games match your filters")
+            return
+        
+        # Sort results
+        sort_value = sort.value if sort else "relevance"
+        if sort_value == "rating_desc":
+            filtered_games.sort(key=lambda x: x['rating'], reverse=True)
+        elif sort_value == "rating_asc":
+            filtered_games.sort(key=lambda x: x['rating'])
+        elif sort_value == "downloads":
+            filtered_games.sort(key=lambda x: x['downloads'], reverse=True)
+        elif sort_value == "newest":
+            filtered_games.sort(key=lambda x: x['thread'].created_at, reverse=True)
+        
+        # Build embed
+        embed = discord.Embed(
+            title=f"🔍 Advanced Search: {query}",
+            description=f"Found {len(filtered_games)} results",
+            color=discord.Color.blue()
+        )
+        
+        # Show filters if applied
+        filters_applied = []
+        if min_rating:
+            filters_applied.append(f"Min Rating: {min_rating}⭐")
+        if tag:
+            filters_applied.append(f"Tag: {tag}")
+        if sort:
+            filters_applied.append(f"Sort: {sort.name}")
+        
+        if filters_applied:
+            embed.add_field(name="Filters", value=" | ".join(filters_applied), inline=False)
+        
+        # Show up to 10 results
+        for game_data in filtered_games[:10]:
+            thread = game_data['thread']
+            rating_str = f"{game_data['rating']:.1f}⭐ ({game_data['reviews_count']})" if game_data['rating'] > 0 else "No ratings"
+            downloads_str = f"{game_data['downloads']} downloads" if game_data['downloads'] > 0 else "No downloads"
+            tags_str = ", ".join(game_data['tags'][:3]) if game_data['tags'] else "No tags"
+            
+            embed.add_field(
+                name=thread.name,
+                value=f"{thread.mention}\n{rating_str} | {downloads_str}\nTags: {tags_str}",
+                inline=False
+            )
+        
+        if len(filtered_games) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(filtered_games)} results")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - LINK HEALTH
+# -------------------------
+@bot.tree.command(name="linkhealth", description="Check link health status")
+async def linkhealth(interaction: discord.Interaction):
+    """View link health status for all games."""
+    await interaction.response.defer()
+    
+    try:
+        if not bot.link_health:
+            await interaction.followup.send("📊 No link health data available yet. Health check runs daily.")
+            return
+        
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library")
+            return
+        
+        # Count healthy vs broken
+        healthy_count = sum(1 for h in bot.link_health.values() if h['status'] == 'healthy')
+        broken_count = sum(1 for h in bot.link_health.values() if h['status'] == 'broken')
+        
+        embed = discord.Embed(
+            title="🔗 Link Health Status",
+            description=f"**{healthy_count}** healthy | **{broken_count}** with issues",
+            color=discord.Color.green() if broken_count == 0 else discord.Color.orange()
+        )
+        
+        # Show games with broken links
+        if broken_count > 0:
+            broken_games = []
+            for thread_id, health_data in bot.link_health.items():
+                if health_data['status'] == 'broken':
+                    try:
+                        thread = await output_channel.fetch_channel(thread_id)
+                        if thread:
+                            broken_games.append({
+                                'thread': thread,
+                                'broken_count': len(health_data['broken_links']),
+                                'total': health_data['total_links']
+                            })
+                    except:
+                        pass
+            
+            # Show up to 10 games with issues
+            for game_data in broken_games[:10]:
+                thread = game_data['thread']
+                embed.add_field(
+                    name=f"⚠️ {thread.name}",
+                    value=f"{thread.mention}\n{game_data['broken_count']}/{game_data['total']} links broken",
+                    inline=False
+                )
+            
+            if len(broken_games) > 10:
+                embed.set_footer(text=f"Showing 10 of {len(broken_games)} games with issues")
+        else:
+            embed.add_field(name="✅ All Clear", value="All monitored links are healthy!", inline=False)
+        
+        # Show last check time
+        if bot.link_health:
+            latest_check = max(h['checked_at'] for h in bot.link_health.values())
+            embed.set_footer(text=f"Last check: {latest_check}")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="checkhealth", description="Manually trigger link health check (Admin only)")
+async def checkhealth(interaction: discord.Interaction):
+    """Manually trigger link health check."""
+    # Check if user has admin role
+    if ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+        await interaction.response.send_message("❌ You need admin role to trigger health checks", ephemeral=True)
+        return
+    
+    await interaction.response.send_message("🔍 Starting link health check... This may take a few minutes.", ephemeral=True)
+    
+    try:
+        # Run the health check
+        await link_health_monitor()
+        await interaction.followup.send("✅ Link health check complete! Use `/linkhealth` to view results.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 # -------------------------
 # RUN

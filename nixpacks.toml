@@ -1,15 +1,15 @@
 [phases.setup]
-nixPkgs = ["python311", "bash"]
+nixPkgs = ["python311"]
 
 [phases.install]
 cmds = [
     "pip install --upgrade pip", 
     "pip install -r requirements.txt",
-    "chmod +x start.sh"
+    "python -m playwright install --with-deps chromium"
 ]
 
 [start]
-cmd = "./start.sh"
+cmd = "python bot.py"
 
 [variables]
 PYTHON_VERSION = "3.11"

@@ -62,6 +62,14 @@ bot.collections = {}  # Track user collections (user_id: {collection_name: [thre
 bot.bookmarks = {}  # Track user bookmarks (user_id: [thread_ids])
 bot.compatibility_reports = {}  # Track compatibility reports (thread_id: [{user_id, status, specs, notes}])
 bot.user_preferences = {}  # Track user genre preferences for recommendations (user_id: {genres, playtime})
+bot.steam_gaming_status = {}  # Track current gaming status (discord_id: {game, timestamp})
+bot.steam_activity_channel_id = 1431592234368766002  # Channel to send gaming notifications
+bot.steam_privacy_settings = {}  # Track user privacy settings (discord_id: {vc_invites: bool})
+bot.steam_achievements = {}  # Track recent achievements (discord_id: {game_id: [achievements]})
+bot.steam_sessions = {}  # Track gaming sessions (discord_id: [{game, start, end, duration}])
+bot.steam_wishlists = {}  # Track Steam wishlists (discord_id: [game_ids])
+bot.game_nights = {}  # Track scheduled game nights (guild_id: [{host, game, time, participants}])
+bot.squad_notifications = {}  # Track squad up notifications (game: [user_ids])
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -325,6 +333,77 @@ async def update_status_message(status: str):
         
     except Exception as e:
         print(f"⚠️ Error updating status message: {e}")
+
+# =========================================================
+# INVITE TO VC VIEW FOR STEAM NOTIFICATIONS
+# =========================================================
+class InviteToVCView(discord.ui.View):
+    def __init__(self, player_id: int, player_name: str):
+        super().__init__(timeout=3600)  # 1 hour timeout
+        self.player_id = player_id
+        self.player_name = player_name
+    
+    @discord.ui.button(label="📞 Invite to VC", style=discord.ButtonStyle.blurple, custom_id="invite_to_vc")
+    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Send VC invite to the player"""
+        try:
+            # Check if player has VC invites enabled
+            privacy_settings = bot.steam_privacy_settings.get(str(self.player_id), {})
+            if not privacy_settings.get('vc_invites', True):  # Default to True
+                await interaction.response.send_message(
+                    "❌ This user has disabled VC invites in their privacy settings.",
+                    ephemeral=True
+                )
+                return
+            
+            # Get the player
+            player = bot.get_user(self.player_id)
+            if not player:
+                try:
+                    player = await bot.fetch_user(self.player_id)
+                except:
+                    await interaction.response.send_message(
+                        "❌ Could not find the user.",
+                        ephemeral=True
+                    )
+                    return
+            
+            # Create invite embed
+            invite_embed = discord.Embed(
+                title="📞 Voice Chat Invite",
+                description=f"**{interaction.user.mention}** wants to play with you!",
+                color=discord.Color.blurple(),
+                timestamp=discord.utils.utcnow()
+            )
+            invite_embed.set_author(
+                name=interaction.user.display_name,
+                icon_url=interaction.user.display_avatar.url
+            )
+            invite_embed.add_field(
+                name="From Server",
+                value=interaction.guild.name if interaction.guild else "Direct Message",
+                inline=False
+            )
+            invite_embed.set_footer(text="Click below to join their voice channel!")
+            
+            # Try to send DM
+            try:
+                await player.send(embed=invite_embed)
+                await interaction.response.send_message(
+                    f"✅ Sent a VC invite to **{self.player_name}**!",
+                    ephemeral=True
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    f"❌ Could not send DM to **{self.player_name}**. They may have DMs disabled.",
+                    ephemeral=True
+                )
+        
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Error: {e}",
+                ephemeral=True
+            )
 
 # =========================================================
 # IGDB API CLIENT
@@ -1047,6 +1126,12 @@ async def on_ready():
     load_collections_data()
     load_compatibility_data()
     
+    # Start Steam OAuth server
+    from steam_oauth_server import start_oauth_server
+    oauth_port = int(os.getenv('STEAM_OAUTH_PORT', '5000'))
+    start_oauth_server(port=oauth_port)
+    print(f"✅ Steam OAuth server started on port {oauth_port}")
+    
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
     
@@ -1079,6 +1164,11 @@ async def on_ready():
     if not auto_backup.is_running():
         auto_backup.start()
         print(f"✅ Auto-backup started (runs daily)")
+    
+    # Start Steam activity monitor
+    if not steam_activity_monitor.is_running():
+        steam_activity_monitor.start()
+        print(f"✅ Steam activity monitor started (checks every 10 seconds)")
     
     # Start Playwright queue processor
     if not playwright_queue_processor.is_running():
@@ -1636,6 +1726,260 @@ async def auto_backup():
 
 @auto_backup.before_loop
 async def before_auto_backup():
+    await bot.wait_until_ready()
+
+# =========================================================
+# STEAM ACTIVITY MONITOR
+# =========================================================
+@tasks.loop(seconds=10)  # Check every 10 seconds
+async def steam_activity_monitor():
+    """Monitor Steam gaming activity and send notifications only when games change"""
+    try:
+        # Skip if no channel configured
+        if not bot.steam_activity_channel_id:
+            print("⚠️ Steam monitor: No channel configured")
+            return
+        
+        channel = bot.get_channel(bot.steam_activity_channel_id)
+        if not channel:
+            print(f"⚠️ Steam monitor: Channel {bot.steam_activity_channel_id} not found")
+            return
+        
+        # Get all linked Steam accounts
+        from steam_utils import SteamLinker, SteamAPI
+        steam_links = SteamLinker.load_links()
+        
+        if not steam_links:
+            print("⚠️ Steam monitor: No linked accounts")
+            return
+        
+        print(f"🔍 Checking {len(steam_links)} linked Steam accounts...")
+        
+        # Check each linked user
+        for discord_id, steam_id in steam_links.items():
+            try:
+                # Get their Steam profile
+                profile = await SteamAPI.get_player_summaries(steam_id)
+                if not profile:
+                    print(f"⚠️ No profile data for Steam ID {steam_id}")
+                    continue
+                
+                current_game = profile.get('gameextrainfo')
+                discord_id_str = str(discord_id)
+                previous_status = bot.steam_gaming_status.get(discord_id_str)
+                
+                print(f"👤 {profile.get('personaname', 'Unknown')}: {current_game if current_game else 'Not playing'}")
+                
+                # Case 1: User is playing a game
+                if current_game:
+                    # Only notify if game changed (not same game, not just started same game again)
+                    if not previous_status or previous_status.get('game') != current_game:
+                        # Get Discord user - try cache first, then fetch
+                        user = bot.get_user(int(discord_id))
+                        if not user:
+                            try:
+                                user = await bot.fetch_user(int(discord_id))
+                            except:
+                                print(f"⚠️ Could not fetch Discord user {discord_id}")
+                                continue
+                        
+                        # Create notification embed for game switch
+                        embed = discord.Embed(
+                            description=f"## 🎮 {user.mention} is now playing\n# **{current_game}**",
+                            color=discord.Color.from_rgb(102, 187, 106),  # Modern green
+                            timestamp=discord.utils.utcnow()
+                        )
+                        
+                        # Add large game image
+                        game_id = profile.get('gameid')
+                        if game_id:
+                            game_image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game_id}/header.jpg"
+                            embed.set_image(url=game_image_url)
+                        
+                        # Add Steam info with avatar
+                        if 'avatarmedium' in profile:
+                            embed.set_author(
+                                name=profile.get('personaname', 'Steam User'),
+                                icon_url=profile['avatarmedium'],
+                                url=profile.get('profileurl', '')
+                            )
+                        
+                        # Add status indicator
+                        embed.set_footer(
+                            text="🟢 Online and Playing",
+                            icon_url=user.display_avatar.url
+                        )
+                        
+                        # Create view with invite button
+                        view = InviteToVCView(int(discord_id), profile.get('personaname', 'Player'))
+                        
+                        # Send notification and store message ID
+                        message = await channel.send(embed=embed, view=view)
+                        
+                        # Update status buffer with new game and message ID
+                        bot.steam_gaming_status[discord_id_str] = {
+                            'game': current_game,
+                            'game_id': profile.get('gameid'),
+                            'message_id': message.id,
+                            'timestamp': discord.utils.utcnow(),
+                            'start_time': discord.utils.utcnow()
+                        }
+                        
+                        print(f"📢 Notification sent: {user.name} switched to {current_game}")
+                    else:
+                        print(f"✓ Still playing {current_game} (no notification)")
+                
+                # Case 2: User stopped playing
+                else:
+                    # Edit the notification message if they were playing before
+                    if discord_id_str in bot.steam_gaming_status:
+                        previous_game = bot.steam_gaming_status[discord_id_str].get('game')
+                        message_id = bot.steam_gaming_status[discord_id_str].get('message_id')
+                        
+                        if message_id:
+                            try:
+                                # Fetch the original message
+                                message = await channel.fetch_message(message_id)
+                                
+                                # Get Discord user - try cache first, then fetch
+                                user = bot.get_user(int(discord_id))
+                                if not user:
+                                    try:
+                                        user = await bot.fetch_user(int(discord_id))
+                                    except:
+                                        print(f"⚠️ Could not fetch Discord user {discord_id}")
+                                        del bot.steam_gaming_status[discord_id_str]
+                                        continue
+                                
+                                # Create session ended embed
+                                embed = discord.Embed(
+                                    description=f"## 🎮 {user.mention} finished playing\n# **{previous_game}**",
+                                    color=discord.Color.from_rgb(239, 83, 80),  # Modern red
+                                    timestamp=discord.utils.utcnow()
+                                )
+                                
+                                # Add game image (stored from previous session)
+                                previous_game_id = bot.steam_gaming_status[discord_id_str].get('game_id')
+                                if previous_game_id:
+                                    game_image_url = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{previous_game_id}/header.jpg"
+                                    embed.set_image(url=game_image_url)
+                                
+                                # Add Steam info
+                                if 'avatarmedium' in profile:
+                                    embed.set_author(
+                                        name=profile.get('personaname', 'Steam User'),
+                                        icon_url=profile['avatarmedium'],
+                                        url=profile.get('profileurl', '')
+                                    )
+                                
+                                # Add status indicator
+                                embed.set_footer(
+                                    text="⚫ Session Ended",
+                                    icon_url=user.display_avatar.url
+                                )
+                                
+                                # Edit the original message (remove buttons)
+                                await message.edit(embed=embed, view=None)
+                                print(f"📢 Message edited: {user.name} stopped playing {previous_game}")
+                                
+                                # Track session for history
+                                start_time = bot.steam_gaming_status[discord_id_str].get('start_time')
+                                if start_time:
+                                    end_time = discord.utils.utcnow()
+                                    duration_mins = int((end_time - start_time).total_seconds() / 60)
+                                    
+                                    # Save session
+                                    if discord_id_str not in bot.steam_sessions:
+                                        bot.steam_sessions[discord_id_str] = []
+                                    
+                                    bot.steam_sessions[discord_id_str].append({
+                                        'game': previous_game,
+                                        'start': start_time,
+                                        'end': end_time,
+                                        'duration': duration_mins
+                                    })
+                                    
+                                    # Keep only last 100 sessions per user
+                                    if len(bot.steam_sessions[discord_id_str]) > 100:
+                                        bot.steam_sessions[discord_id_str] = bot.steam_sessions[discord_id_str][-100:]
+                                    
+                                    print(f"📊 Session saved: {duration_mins} mins")
+                                
+                            except discord.NotFound:
+                                print(f"⚠️ Original message not found, cannot edit")
+                            except Exception as e:
+                                print(f"⚠️ Error editing message: {e}")
+                        
+                        # Clear from buffer
+                        del bot.steam_gaming_status[discord_id_str]
+            
+            except Exception as e:
+                print(f"⚠️ Error checking Steam status for {discord_id}: {e}")
+                continue
+        
+        # Check for squad up opportunities (multiple people playing same game)
+        await check_squad_opportunities(channel, steam_links)
+    
+    except Exception as e:
+        print(f"⚠️ Error in steam_activity_monitor: {e}")
+
+async def check_squad_opportunities(channel, steam_links):
+    """Check if multiple people are playing the same game"""
+    try:
+        game_players = {}  # game: [discord_ids]
+        
+        for discord_id, steam_id in steam_links.items():
+            status = bot.steam_gaming_status.get(str(discord_id))
+            if status and status.get('game'):
+                game_name = status['game']
+                if game_name not in game_players:
+                    game_players[game_name] = []
+                game_players[game_name].append(discord_id)
+        
+        # Notify if 2+ people are playing same game
+        for game_name, player_ids in game_players.items():
+            if len(player_ids) >= 2:
+                # Check if we already notified about this squad
+                squad_key = f"{game_name}:{sorted(player_ids)}"
+                if squad_key not in bot.squad_notifications:
+                    # Get all users
+                    users = []
+                    for pid in player_ids:
+                        user = bot.get_user(int(pid))
+                        if not user:
+                            try:
+                                user = await bot.fetch_user(int(pid))
+                            except:
+                                continue
+                        if user:
+                            users.append(user)
+                    
+                    if len(users) >= 2:
+                        # Create squad notification
+                        embed = discord.Embed(
+                            title="👥 Squad Up!",
+                            description=f"**{len(users)}** members are playing **{game_name}**\n\n" + 
+                                      "\n".join([f"• {u.mention}" for u in users]),
+                            color=discord.Color.blurple(),
+                            timestamp=discord.utils.utcnow()
+                        )
+                        embed.set_footer(text="Join them for some multiplayer action!")
+                        
+                        await channel.send(embed=embed)
+                        bot.squad_notifications[squad_key] = True
+                        print(f"👥 Squad notification sent for {game_name}")
+        
+        # Clean up old squad notifications
+        current_squads = [f"{g}:{sorted(p)}" for g, p in game_players.items() if len(p) >= 2]
+        for key in list(bot.squad_notifications.keys()):
+            if key not in current_squads:
+                del bot.squad_notifications[key]
+    
+    except Exception as e:
+        print(f"⚠️ Error checking squad opportunities: {e}")
+
+@steam_activity_monitor.before_loop
+async def before_steam_activity_monitor():
     await bot.wait_until_ready()
 
 # =========================================================
@@ -5550,6 +5894,961 @@ async def recommend(interaction: discord.Interaction):
         
         await interaction.followup.send(embed=embed)
         
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# STEAM INTEGRATION
+# -------------------------
+from steam_utils import SteamAPI, SteamLinker, format_playtime, get_personastate_string
+
+@bot.tree.command(name="linksteam", description="Link your Discord account to your Steam account")
+async def linksteam(interaction: discord.Interaction):
+    """Link Discord account to Steam via OAuth"""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Get OAuth base URL from environment
+        oauth_base_url = os.getenv('STEAM_OAUTH_BASE_URL', 'http://localhost:5000')
+        
+        # Generate authentication URL
+        auth_url = f"{oauth_base_url}/auth/login?discord_id={interaction.user.id}"
+        
+        # Create embed with login button
+        embed = discord.Embed(
+            title="🎮 Link Your Steam Account",
+            description="Click the button below to securely link your Steam account through Steam's official login.",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="How it works:",
+            value="1️⃣ Click the link below\n2️⃣ Sign in with your Steam account\n3️⃣ You'll be automatically linked!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔒 Security",
+            value="We never see your Steam password. Authentication is handled securely by Steam.",
+            inline=False
+        )
+        
+        embed.set_footer(text="Link expires in 10 minutes")
+        
+        # Create button view
+        view = discord.ui.View()
+        button = discord.ui.Button(
+            label="Login with Steam",
+            style=discord.ButtonStyle.link,
+            url=auth_url,
+            emoji="🎮"
+        )
+        view.add_item(button)
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="unlinksteam", description="Unlink your Steam account")
+async def unlinksteam(interaction: discord.Interaction):
+    """Unlink Discord account from Steam"""
+    await interaction.response.defer()
+    
+    try:
+        if SteamLinker.unlink_account(str(interaction.user.id)):
+            await interaction.followup.send("✅ Steam account unlinked successfully!")
+        else:
+            await interaction.followup.send("❌ You don't have a linked Steam account.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="steamprofile", description="View a Steam profile")
+async def steamprofile(interaction: discord.Interaction, user: discord.User = None):
+    """View Steam profile information"""
+    await interaction.response.defer()
+    
+    try:
+        target_user = user or interaction.user
+        steam_id = SteamLinker.get_steam_id(str(target_user.id))
+        
+        if not steam_id:
+            if target_user == interaction.user:
+                await interaction.followup.send("❌ You haven't linked your Steam account yet! Use `/linksteam` to link it.")
+            else:
+                await interaction.followup.send(f"❌ {target_user.display_name} hasn't linked their Steam account yet.")
+            return
+        
+        profile = await SteamAPI.get_player_summaries(steam_id)
+        if not profile:
+            await interaction.followup.send("❌ Could not fetch Steam profile.")
+            return
+        
+        # Get game count and playtime
+        games = await SteamAPI.get_owned_games(steam_id, include_appinfo=False)
+        game_count = len(games) if games else 0
+        total_playtime = sum(g.get('playtime_forever', 0) for g in games) if games else 0
+        
+        # Status emoji
+        status_emojis = {
+            "Online": "🟢",
+            "Offline": "⚫",
+            "Busy": "🔴",
+            "Away": "🟡",
+            "Snooze": "😴",
+            "Looking to trade": "💰",
+            "Looking to play": "🎮"
+        }
+        status = get_personastate_string(profile.get('personastate', 0))
+        status_emoji = status_emojis.get(status, "⚫")
+        
+        # Create rich embed
+        embed = discord.Embed(
+            title=f"{profile.get('personaname', 'Unknown')}",
+            url=profile.get('profileurl', ''),
+            description=f"{status_emoji} **{status}**",
+            color=discord.Color.from_rgb(27, 40, 56)  # Steam dark blue
+        )
+        
+        # Set Steam avatar as thumbnail
+        if 'avatarfull' in profile:
+            embed.set_thumbnail(url=profile['avatarfull'])
+        
+        # Add Steam logo as author icon
+        embed.set_author(
+            name="Steam Profile",
+            icon_url="https://upload.wikimedia.org/wikipedia/commons/8/83/Steam_icon_logo.svg"
+        )
+        
+        # Account info
+        if 'timecreated' in profile:
+            from datetime import datetime
+            created = datetime.fromtimestamp(profile['timecreated'])
+            years = (datetime.now() - created).days // 365
+            embed.add_field(
+                name="📅 Member Since",
+                value=f"{created.strftime('%B %Y')}\n({years} years)",
+                inline=True
+            )
+        
+        # Games owned
+        if game_count > 0:
+            embed.add_field(
+                name="🎮 Games Owned",
+                value=f"**{game_count:,}** games\n{format_playtime(total_playtime)} played",
+                inline=True
+            )
+        
+        # Level (if available in profile)
+        if 'loccountrycode' in profile:
+            embed.add_field(
+                name="🌍 Country",
+                value=profile['loccountrycode'].upper(),
+                inline=True
+            )
+        
+        # Currently playing
+        if 'gameextrainfo' in profile:
+            embed.add_field(
+                name="🎯 Currently Playing",
+                value=f"**{profile['gameextrainfo']}**",
+                inline=False
+            )
+        
+        # Profile URL as button-style field
+        embed.add_field(
+            name="🔗 Links",
+            value=f"[View Full Profile on Steam]({profile.get('profileurl', 'N/A')})",
+            inline=False
+        )
+        
+        # Footer with Discord user
+        embed.set_footer(
+            text=f"Linked to {target_user.display_name}",
+            icon_url=target_user.display_avatar.url
+        )
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="steamlibrary", description="View your or someone's Steam game library")
+async def steamlibrary(interaction: discord.Interaction, user: discord.User = None, sort_by: str = "playtime"):
+    """View Steam game library"""
+    await interaction.response.defer()
+    
+    try:
+        target_user = user or interaction.user
+        steam_id = SteamLinker.get_steam_id(str(target_user.id))
+        
+        if not steam_id:
+            if target_user == interaction.user:
+                await interaction.followup.send("❌ You haven't linked your Steam account yet! Use `/linksteam` to link it.")
+            else:
+                await interaction.followup.send(f"❌ {target_user.display_name} hasn't linked their Steam account yet.")
+            return
+        
+        games = await SteamAPI.get_owned_games(steam_id)
+        if not games:
+            await interaction.followup.send("❌ Could not fetch game library or library is private.")
+            return
+        
+        # Sort games
+        if sort_by == "playtime":
+            games.sort(key=lambda x: x.get('playtime_forever', 0), reverse=True)
+        elif sort_by == "name":
+            games.sort(key=lambda x: x.get('name', ''))
+        elif sort_by == "recent":
+            games.sort(key=lambda x: x.get('rtime_last_played', 0), reverse=True)
+        
+        # Create pagination view
+        class LibraryPaginationView(discord.ui.View):
+            def __init__(self, games_list, target_user, sort_by):
+                super().__init__(timeout=180)  # 3 minutes
+                self.games = games_list
+                self.target_user = target_user
+                self.sort_by = sort_by
+                self.current_page = 0
+                self.per_page = 10
+                self.total_pages = (len(games_list) + self.per_page - 1) // self.per_page
+                
+                # Disable buttons if only one page
+                if self.total_pages <= 1:
+                    self.previous_button.disabled = True
+                    self.next_button.disabled = True
+            
+            def create_embed(self):
+                start_idx = self.current_page * self.per_page
+                end_idx = start_idx + self.per_page
+                page_games = self.games[start_idx:end_idx]
+                
+                total_playtime = sum(g.get('playtime_forever', 0) for g in self.games)
+                avg_playtime = total_playtime // len(self.games) if len(self.games) > 0 else 0
+                
+                embed = discord.Embed(
+                    title=f"🎮 {self.target_user.display_name}'s Steam Library",
+                    description=f"**{len(self.games):,}** games • **{format_playtime(total_playtime)}** played • **{format_playtime(avg_playtime)}** avg",
+                    color=discord.Color.from_rgb(27, 40, 56)
+                )
+                
+                embed.set_thumbnail(url=self.target_user.display_avatar.url)
+                
+                # Show games for this page
+                games_text = []
+                for i, game in enumerate(page_games, start_idx + 1):
+                    playtime = game.get('playtime_forever', 0)
+                    
+                    # Medal for top 3
+                    if i <= 3:
+                        medal = ["🥇", "🥈", "🥉"][i-1]
+                    else:
+                        medal = f"**{i}.**"
+                    
+                    game_name = game.get('name', 'Unknown')
+                    # Truncate long names
+                    if len(game_name) > 35:
+                        game_name = game_name[:32] + "..."
+                    
+                    games_text.append(f"{medal} {game_name}\n└ {format_playtime(playtime)}\n")
+                
+                embed.add_field(
+                    name=f"Games (sorted by {self.sort_by})",
+                    value="\n".join(games_text),
+                    inline=False
+                )
+                
+                embed.set_footer(
+                    text=f"Page {self.current_page + 1}/{self.total_pages} • {len(self.games):,} total games",
+                    icon_url=self.target_user.display_avatar.url
+                )
+                embed.timestamp = discord.utils.utcnow()
+                
+                return embed
+            
+            @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+            async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if self.current_page > 0:
+                    self.current_page -= 1
+                    
+                # Update button states
+                self.previous_button.disabled = self.current_page == 0
+                self.next_button.disabled = self.current_page >= self.total_pages - 1
+                
+                await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            
+            @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+            async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                if self.current_page < self.total_pages - 1:
+                    self.current_page += 1
+                    
+                # Update button states
+                self.previous_button.disabled = self.current_page == 0
+                self.next_button.disabled = self.current_page >= self.total_pages - 1
+                
+                await interaction.response.edit_message(embed=self.create_embed(), view=self)
+            
+            async def on_timeout(self):
+                # Disable all buttons when view times out
+                for item in self.children:
+                    item.disabled = True
+        
+        # Create and send initial view
+        view = LibraryPaginationView(games, target_user, sort_by)
+        view.previous_button.disabled = True  # Start at first page
+        
+        await interaction.followup.send(embed=view.create_embed(), view=view)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="comparegames", description="Find common games between you and another user")
+async def comparegames(interaction: discord.Interaction, user: discord.User):
+    """Compare game libraries"""
+    await interaction.response.defer()
+    
+    try:
+        # Get both Steam IDs
+        steam_id1 = SteamLinker.get_steam_id(str(interaction.user.id))
+        steam_id2 = SteamLinker.get_steam_id(str(user.id))
+        
+        if not steam_id1:
+            await interaction.followup.send("❌ You haven't linked your Steam account yet! Use `/linksteam` to link it.")
+            return
+        
+        if not steam_id2:
+            await interaction.followup.send(f"❌ {user.display_name} hasn't linked their Steam account yet.")
+            return
+        
+        # Get both libraries
+        games1 = await SteamAPI.get_owned_games(steam_id1)
+        games2 = await SteamAPI.get_owned_games(steam_id2)
+        
+        if not games1 or not games2:
+            await interaction.followup.send("❌ Could not fetch one or both game libraries (may be private).")
+            return
+        
+        # Find common games
+        appids1 = {g['appid']: g for g in games1}
+        appids2 = {g['appid']: g for g in games2}
+        common_appids = set(appids1.keys()) & set(appids2.keys())
+        
+        if not common_appids:
+            await interaction.followup.send(f"❌ No common games found between you and {user.display_name}!")
+            return
+        
+        # Get common games with playtime
+        common_games = []
+        for appid in common_appids:
+            game1 = appids1[appid]
+            game2 = appids2[appid]
+            total_playtime = game1.get('playtime_forever', 0) + game2.get('playtime_forever', 0)
+            common_games.append({
+                'name': game1.get('name', 'Unknown'),
+                'playtime1': game1.get('playtime_forever', 0),
+                'playtime2': game2.get('playtime_forever', 0),
+                'total': total_playtime
+            })
+        
+        # Sort by total playtime
+        common_games.sort(key=lambda x: x['total'], reverse=True)
+        
+        embed = discord.Embed(
+            title=f"🎮 Common Games",
+            description=f"**{interaction.user.display_name}** and **{user.display_name}** have **{len(common_games)}** games in common!",
+            color=discord.Color.green()
+        )
+        
+        # Show top 10
+        for game in common_games[:10]:
+            embed.add_field(
+                name=game['name'],
+                value=f"{interaction.user.display_name}: {format_playtime(game['playtime1'])}\n{user.display_name}: {format_playtime(game['playtime2'])}",
+                inline=False
+            )
+        
+        if len(common_games) > 10:
+            embed.set_footer(text=f"Showing top 10 of {len(common_games)} common games")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="nowplaying", description="See what your Steam friends are playing")
+async def nowplaying(interaction: discord.Interaction):
+    """View what Steam friends are currently playing"""
+    await interaction.response.defer()
+    
+    try:
+        steam_id = SteamLinker.get_steam_id(str(interaction.user.id))
+        
+        if not steam_id:
+            await interaction.followup.send("❌ You haven't linked your Steam account yet! Use `/linksteam` to link it.")
+            return
+        
+        friends = await SteamAPI.get_friend_list(steam_id)
+        if not friends:
+            await interaction.followup.send("❌ Could not fetch friends list (may be private).")
+            return
+        
+        # Get all friend profiles
+        friend_ids = [f['steamid'] for f in friends[:100]]  # Limit to 100
+        playing_now = []
+        
+        for friend_id in friend_ids:
+            profile = await SteamAPI.get_player_summaries(friend_id)
+            if profile and 'gameextrainfo' in profile:
+                playing_now.append({
+                    'name': profile.get('personaname', 'Unknown'),
+                    'game': profile['gameextrainfo'],
+                    'status': get_personastate_string(profile.get('personastate', 0))
+                })
+        
+        if not playing_now:
+            await interaction.followup.send("🎮 None of your Steam friends are playing games right now.")
+            return
+        
+        embed = discord.Embed(
+            title="🎮 Friends Playing Now",
+            description=f"**{len(playing_now)}** of your friends are playing games",
+            color=discord.Color.green()
+        )
+        
+        for friend in playing_now[:15]:  # Show max 15
+            embed.add_field(
+                name=friend['name'],
+                value=f"Playing **{friend['game']}**",
+                inline=False
+            )
+        
+        if len(playing_now) > 15:
+            embed.set_footer(text=f"Showing 15 of {len(playing_now)} friends playing")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="whoson", description="See which server members are playing games on Steam")
+async def whoson(interaction: discord.Interaction):
+    """View which Discord server members are currently playing games"""
+    await interaction.response.defer()
+    
+    try:
+        # Get all server members who have linked Steam accounts
+        steam_links = SteamLinker.load_links()
+        
+        if not steam_links:
+            await interaction.followup.send("❌ No one in this server has linked their Steam account yet!")
+            return
+        
+        # Get guild members
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("❌ This command can only be used in a server!")
+            return
+        
+        playing_now = []
+        
+        # Check each linked member
+        for discord_id, steam_id in steam_links.items():
+            # Check if this user is in the current guild
+            member = guild.get_member(int(discord_id))
+            if not member:
+                continue
+            
+            # Get their Steam profile
+            profile = await SteamAPI.get_player_summaries(steam_id)
+            if profile and 'gameextrainfo' in profile:
+                playing_now.append({
+                    'discord_user': member,
+                    'steam_name': profile.get('personaname', 'Unknown'),
+                    'game': profile['gameextrainfo'],
+                    'avatar': profile.get('avatarmedium', ''),
+                    'status': get_personastate_string(profile.get('personastate', 0))
+                })
+        
+        if not playing_now:
+            await interaction.followup.send("🎮 No one in this server is playing games on Steam right now.")
+            return
+        
+        # Sort by Discord username
+        playing_now.sort(key=lambda x: x['discord_user'].display_name.lower())
+        
+        embed = discord.Embed(
+            title="🎮 Who's Gaming Right Now?",
+            description=f"**{len(playing_now)}** server members are playing games on Steam",
+            color=discord.Color.from_rgb(27, 40, 56)
+        )
+        
+        embed.set_author(
+            name=f"{guild.name} Gaming Activity",
+            icon_url=guild.icon.url if guild.icon else None
+        )
+        
+        # Show all players (with limit for very large servers)
+        for player in playing_now[:20]:
+            game_name = player['game']
+            # Truncate very long game names
+            if len(game_name) > 40:
+                game_name = game_name[:37] + "..."
+            
+            embed.add_field(
+                name=f"🎮 {player['discord_user'].display_name}",
+                value=f"**{game_name}**\n└ {player['status']}",
+                inline=True
+            )
+        
+        if len(playing_now) > 20:
+            embed.set_footer(text=f"Showing 20 of {len(playing_now)} players • {guild.name}")
+        else:
+            embed.set_footer(text=f"{guild.name}")
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="setsteamchannel", description="Set channel for automatic Steam gaming notifications (Admin only)")
+async def setsteamchannel(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Set the channel where Steam gaming notifications will be posted"""
+    
+    # Check if user has admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need Administrator permissions to use this command!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if channel is None:
+            # Disable notifications
+            bot.steam_activity_channel_id = None
+            await interaction.followup.send("✅ Steam gaming notifications have been **disabled**.", ephemeral=True)
+        else:
+            # Set notification channel
+            bot.steam_activity_channel_id = channel.id
+            
+            # Start the monitor if not already running
+            if not steam_activity_monitor.is_running():
+                steam_activity_monitor.start()
+                print(f"✅ Steam activity monitor started")
+            
+            # Send confirmation
+            embed = discord.Embed(
+                title="✅ Steam Notifications Enabled",
+                description=f"Gaming notifications will now be posted in {channel.mention}",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="What gets posted?",
+                value="• When members switch games\n• Real-time gaming activity\n• Checked every 10 seconds\n• No spam - only on game changes",
+                inline=False
+            )
+            embed.set_footer(text="Members need to link their Steam accounts with /linksteam")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+            # Send test message to the channel
+            test_embed = discord.Embed(
+                title="🎮 Steam Gaming Notifications",
+                description="This channel will now receive notifications when server members switch games on Steam!",
+                color=discord.Color.from_rgb(27, 40, 56)
+            )
+            test_embed.set_footer(text="Powered by Steam API • Updates every 10 seconds • No spam on same game")
+            await channel.send(embed=test_embed)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="steamprivacy", description="Manage your Steam gaming notification privacy settings")
+async def steamprivacy(interaction: discord.Interaction):
+    """Configure Steam privacy settings"""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        user_id = str(interaction.user.id)
+        
+        # Get current settings or defaults
+        current_settings = bot.steam_privacy_settings.get(user_id, {
+            'vc_invites': True
+        })
+        
+        # Create settings embed
+        embed = discord.Embed(
+            title="⚙️ Steam Privacy Settings",
+            description="Manage your Steam gaming notification preferences",
+            color=discord.Color.from_rgb(27, 40, 56)
+        )
+        
+        # Show current settings
+        vc_status = "🟢 Enabled" if current_settings.get('vc_invites', True) else "🔴 Disabled"
+        embed.add_field(
+            name="📞 Voice Chat Invites",
+            value=f"**Status:** {vc_status}\nAllow others to invite you to voice chat when you're playing",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"User ID: {interaction.user.id}")
+        
+        # Create toggle view
+        class PrivacySettingsView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=180)
+            
+            @discord.ui.button(label="Toggle VC Invites", style=discord.ButtonStyle.blurple, emoji="📞")
+            async def toggle_vc(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+                if btn_interaction.user.id != interaction.user.id:
+                    await btn_interaction.response.send_message("❌ These are not your settings!", ephemeral=True)
+                    return
+                
+                # Toggle setting
+                user_id = str(btn_interaction.user.id)
+                current = bot.steam_privacy_settings.get(user_id, {})
+                current['vc_invites'] = not current.get('vc_invites', True)
+                bot.steam_privacy_settings[user_id] = current
+                
+                # Update embed
+                vc_status = "🟢 Enabled" if current['vc_invites'] else "🔴 Disabled"
+                new_embed = discord.Embed(
+                    title="⚙️ Steam Privacy Settings",
+                    description="Manage your Steam gaming notification preferences",
+                    color=discord.Color.from_rgb(27, 40, 56)
+                )
+                new_embed.add_field(
+                    name="📞 Voice Chat Invites",
+                    value=f"**Status:** {vc_status}\nAllow others to invite you to voice chat when you're playing",
+                    inline=False
+                )
+                new_embed.set_footer(text=f"User ID: {btn_interaction.user.id}")
+                
+                await btn_interaction.response.edit_message(embed=new_embed)
+                await btn_interaction.followup.send(
+                    f"✅ VC Invites are now **{'enabled' if current['vc_invites'] else 'disabled'}**!",
+                    ephemeral=True
+                )
+        
+        await interaction.followup.send(embed=embed, view=PrivacySettingsView(), ephemeral=True)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="steamleaderboard", description="View server Steam playtime leaderboard")
+async def steamleaderboard(interaction: discord.Interaction):
+    """Show playtime leaderboard for the server"""
+    await interaction.response.defer()
+    
+    try:
+        steam_links = SteamLinker.load_links()
+        if not steam_links:
+            await interaction.followup.send("❌ No one in this server has linked their Steam account yet!")
+            return
+        
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("❌ This command can only be used in a server!")
+            return
+        
+        leaderboard = []
+        
+        for discord_id, steam_id in steam_links.items():
+            member = guild.get_member(int(discord_id))
+            if not member:
+                continue
+            
+            games = await SteamAPI.get_owned_games(steam_id)
+            if games:
+                total_playtime = sum(g.get('playtime_forever', 0) for g in games)
+                game_count = len(games)
+                leaderboard.append({
+                    'member': member,
+                    'playtime': total_playtime,
+                    'games': game_count
+                })
+        
+        if not leaderboard:
+            await interaction.followup.send("❌ Could not fetch playtime data for any members.")
+            return
+        
+        # Sort by playtime
+        leaderboard.sort(key=lambda x: x['playtime'], reverse=True)
+        
+        embed = discord.Embed(
+            title="🏆 Steam Playtime Leaderboard",
+            description=f"Top gamers in **{guild.name}**",
+            color=discord.Color.gold()
+        )
+        
+        for i, entry in enumerate(leaderboard[:10], 1):
+            medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"**{i}.**"
+            embed.add_field(
+                name=f"{medal} {entry['member'].display_name}",
+                value=f"⏱️ {format_playtime(entry['playtime'])} • 🎮 {entry['games']:,} games",
+                inline=False
+            )
+        
+        if len(leaderboard) > 10:
+            embed.set_footer(text=f"Showing top 10 of {len(leaderboard)} players")
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="gamingsessions", description="View your recent gaming sessions")
+async def gamingsessions(interaction: discord.Interaction, user: discord.User = None):
+    """View gaming session history"""
+    await interaction.response.defer()
+    
+    try:
+        target_user = user or interaction.user
+        discord_id_str = str(target_user.id)
+        
+        sessions = bot.steam_sessions.get(discord_id_str, [])
+        
+        if not sessions:
+            if target_user == interaction.user:
+                await interaction.followup.send("❌ No gaming sessions recorded yet! Start playing to track your sessions.")
+            else:
+                await interaction.followup.send(f"❌ No gaming sessions recorded for {target_user.display_name} yet.")
+            return
+        
+        # Show last 10 sessions
+        recent_sessions = sessions[-10:]
+        
+        embed = discord.Embed(
+            title=f"📊 Recent Gaming Sessions",
+            description=f"**{target_user.display_name}'s** gaming history",
+            color=discord.Color.from_rgb(27, 40, 56)
+        )
+        
+        embed.set_thumbnail(url=target_user.display_avatar.url)
+        
+        for session in reversed(recent_sessions):
+            duration_mins = session.get('duration', 0)
+            start_time = session.get('start', discord.utils.utcnow())
+            
+            embed.add_field(
+                name=f"🎮 {session.get('game', 'Unknown')}",
+                value=f"⏱️ {format_playtime(duration_mins)}\n└ <t:{int(start_time.timestamp())}:R>",
+                inline=True
+            )
+        
+        total_time = sum(s.get('duration', 0) for s in sessions)
+        embed.set_footer(text=f"Total tracked time: {format_playtime(total_time)} • {len(sessions)} sessions")
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="findgame", description="Find games that multiple users all own")
+async def findgame(interaction: discord.Interaction, user1: discord.User, user2: discord.User = None, user3: discord.User = None):
+    """Find common games between multiple users"""
+    await interaction.response.defer()
+    
+    try:
+        users = [interaction.user, user1]
+        if user2:
+            users.append(user2)
+        if user3:
+            users.append(user3)
+        
+        # Get all Steam IDs
+        steam_ids = []
+        for user in users:
+            steam_id = SteamLinker.get_steam_id(str(user.id))
+            if not steam_id:
+                await interaction.followup.send(f"❌ {user.display_name} hasn't linked their Steam account yet!")
+                return
+            steam_ids.append((user, steam_id))
+        
+        # Get all libraries
+        libraries = []
+        for user, steam_id in steam_ids:
+            games = await SteamAPI.get_owned_games(steam_id)
+            if not games:
+                await interaction.followup.send(f"❌ Could not fetch {user.display_name}'s library (may be private).")
+                return
+            libraries.append(set(g['appid'] for g in games))
+        
+        # Find intersection
+        common_appids = libraries[0]
+        for lib in libraries[1:]:
+            common_appids &= lib
+        
+        if not common_appids:
+            await interaction.followup.send(f"❌ No common games found between all {len(users)} users.")
+            return
+        
+        # Get game details
+        first_lib = await SteamAPI.get_owned_games(steam_ids[0][1])
+        common_games = [g for g in first_lib if g['appid'] in common_appids]
+        common_games.sort(key=lambda x: x.get('playtime_forever', 0), reverse=True)
+        
+        embed = discord.Embed(
+            title="🎮 Common Games Found!",
+            description=f"**{len(common_games)}** games owned by all {len(users)} users",
+            color=discord.Color.green()
+        )
+        
+        # Show top 15 games
+        for game in common_games[:15]:
+            embed.add_field(
+                name=game.get('name', 'Unknown'),
+                value=f"AppID: {game['appid']}",
+                inline=True
+            )
+        
+        if len(common_games) > 15:
+            embed.set_footer(text=f"Showing 15 of {len(common_games)} common games")
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="gamenight", description="Plan a game night with your friends")
+async def gamenight(interaction: discord.Interaction, game: str, time: str):
+    """Create a game night event"""
+    await interaction.response.defer()
+    
+    try:
+        guild_id = str(interaction.guild.id) if interaction.guild else None
+        if not guild_id:
+            await interaction.followup.send("❌ This command can only be used in a server!")
+            return
+        
+        # Create game night entry
+        if guild_id not in bot.game_nights:
+            bot.game_nights[guild_id] = []
+        
+        game_night = {
+            'host': interaction.user.id,
+            'game': game,
+            'time': time,
+            'participants': [interaction.user.id],
+            'created_at': discord.utils.utcnow()
+        }
+        
+        bot.game_nights[guild_id].append(game_night)
+        
+        # Create embed
+        embed = discord.Embed(
+            title="🎮 Game Night Planned!",
+            description=f"**{game}**",
+            color=discord.Color.blurple()
+        )
+        
+        embed.add_field(name="🕐 Time", value=time, inline=True)
+        embed.add_field(name="👤 Host", value=interaction.user.mention, inline=True)
+        embed.add_field(name="👥 Participants", value=f"{len(game_night['participants'])} joined", inline=True)
+        
+        embed.set_footer(text="Click Join below to participate!")
+        embed.timestamp = discord.utils.utcnow()
+        
+        # Create join button
+        class GameNightView(discord.ui.View):
+            def __init__(self, game_night_data):
+                super().__init__(timeout=None)
+                self.game_night = game_night_data
+            
+            @discord.ui.button(label="Join Game Night", style=discord.ButtonStyle.green, emoji="✅")
+            async def join_button(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+                user_id = btn_interaction.user.id
+                if user_id not in self.game_night['participants']:
+                    self.game_night['participants'].append(user_id)
+                    await btn_interaction.response.send_message(
+                        f"✅ You joined the game night for **{self.game_night['game']}**!",
+                        ephemeral=True
+                    )
+                    
+                    # Update embed
+                    new_embed = btn_interaction.message.embeds[0]
+                    new_embed.set_field_at(2, name="👥 Participants", value=f"{len(self.game_night['participants'])} joined", inline=True)
+                    await btn_interaction.message.edit(embed=new_embed)
+                else:
+                    await btn_interaction.response.send_message(
+                        "❌ You're already in this game night!",
+                        ephemeral=True
+                    )
+        
+        view = GameNightView(game_night)
+        await interaction.followup.send(embed=embed, view=view)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="steamactivity", description="View recent Steam activity in the server")
+async def steamactivity(interaction: discord.Interaction):
+    """Show recent Steam activity feed"""
+    await interaction.response.defer()
+    
+    try:
+        steam_links = SteamLinker.load_links()
+        if not steam_links:
+            await interaction.followup.send("❌ No one has linked their Steam account yet!")
+            return
+        
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("❌ This command can only be used in a server!")
+            return
+        
+        activities = []
+        
+        for discord_id, steam_id in steam_links.items():
+            member = guild.get_member(int(discord_id))
+            if not member:
+                continue
+            
+            # Get recently played games
+            recent_games = await SteamAPI.get_recently_played_games(steam_id)
+            if recent_games:
+                for game in recent_games[:3]:  # Top 3 recent
+                    activities.append({
+                        'member': member,
+                        'game': game.get('name', 'Unknown'),
+                        'playtime_2weeks': game.get('playtime_2weeks', 0),
+                        'last_played': game.get('playtime_forever', 0)
+                    })
+        
+        if not activities:
+            await interaction.followup.send("❌ No recent activity found.")
+            return
+        
+        # Sort by recent playtime
+        activities.sort(key=lambda x: x['playtime_2weeks'], reverse=True)
+        
+        embed = discord.Embed(
+            title="📜 Recent Steam Activity",
+            description=f"What **{guild.name}** members have been playing",
+            color=discord.Color.from_rgb(27, 40, 56)
+        )
+        
+        for activity in activities[:15]:
+            embed.add_field(
+                name=f"🎮 {activity['member'].display_name}",
+                value=f"**{activity['game']}**\n└ {format_playtime(activity['playtime_2weeks'])} (2 weeks)",
+                inline=True
+            )
+        
+        if len(activities) > 15:
+            embed.set_footer(text=f"Showing 15 of {len(activities)} recent activities")
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 

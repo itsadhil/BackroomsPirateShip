@@ -1,2 +1,45 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Bot data (keep these local)
+bot_state.json
+fitgirl_seen_posts.json
+link_health_data.json
+steam_links.json
+backups/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+debug_*.html
+*.tmp
+
+# Cogs (if you want to keep them local for now)
+cogs/

@@ -4,3 +4,7 @@ python-dotenv
 beautifulsoup4
 playwright
 feedparser
+flask
+python3-openid
+requests
+psutil

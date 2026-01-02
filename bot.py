@@ -1991,13 +1991,9 @@ class FitGirlSearchView(discord.ui.View):
                     interaction=interaction,
                     game_name=game_name,
                     version=version,
-                    game_links=paste_url,  # Use torrent link as game link
+                    game_link=paste_url,  # Use torrent link as game link
                     notes=notes,
-                    torrent_link=paste_url,  # Also set as torrent link
-                    channel_id=OUTPUT_CHANNEL_ID,
-                    user=interaction.user,
-                    fitgirl_url=current['url'],
-                    details=details
+                    torrent_link=paste_url  # Also set as torrent link
                 )
                 
                 await asyncio.sleep(10)

@@ -2735,8 +2735,9 @@ class AddGameTorrentModal(discord.ui.Modal, title="Add a Game (Torrent)"):
 # =========================================================
 async def process_game_submission(interaction, game_name, game_link, torrent_link, notes, version=None):
     """Shared logic to process and post game submissions."""
-    # Defer response since IGDB API call may take time
-    await interaction.response.defer(ephemeral=True)
+    # Defer response if not already responded
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     
     input_channel = bot.get_channel(INPUT_CHANNEL_ID)
     output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)

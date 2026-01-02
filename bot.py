@@ -1053,24 +1053,38 @@ async def fitgirl_rss_monitor():
                 clean_name = clean_game_name_for_search(post['title'])
                 output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
                 
-                existing = False
-                async for thread in output_channel.archived_threads(limit=100):
+                existing_thread = None
+                
+                # FIRST: Check active threads
+                for thread in output_channel.threads:
                     thread_clean = clean_game_name_for_search(thread.name)
                     if thread_clean.lower() == clean_name.lower():
-                        existing = True
-                        print(f"⏭️ Game already exists: {post['title']}")
+                        existing_thread = thread
+                        print(f"✅ Found in active threads: {thread.name}")
                         break
                 
-                if not existing:
-                    for thread in output_channel.threads:
+                # SECOND: Check archived threads if not found
+                if not existing_thread:
+                    async for thread in output_channel.archived_threads(limit=200):
                         thread_clean = clean_game_name_for_search(thread.name)
                         if thread_clean.lower() == clean_name.lower():
-                            existing = True
-                            print(f"⏭️ Game already exists: {post['title']}")
+                            existing_thread = thread
+                            print(f"✅ Found in archived threads: {thread.name}")
                             break
                 
-                if existing:
+                # If game exists, handle accordingly
+                if existing_thread:
+                    # Check if the new post has version info suggesting it's an update
+                    if 'update' in post['title'].lower() or re.search(r'v?\d+\.\d+', post['title']):
+                        print(f"🔄 Detected update for: {clean_name}")
+                        # Post update notification in existing thread
+                        await post_game_update(existing_thread, post['title'], post['link'], paste_url)
+                    else:
+                        print(f"⏭️ Game already exists, skipping: {post['title']}")
+                    
+                    # Mark as seen and save immediately
                     bot.seen_rss_posts.add(post['id'])
+                    save_seen_posts()
                     continue
                 
                 # Download torrent
@@ -1095,6 +1109,7 @@ async def fitgirl_rss_monitor():
                 
                 print(f"✅ Auto-posted: {post['title']}")
                 bot.seen_rss_posts.add(post['id'])
+                save_seen_posts()  # Save immediately after each post
                 
                 # Small delay between posts
                 await asyncio.sleep(10)
@@ -1103,9 +1118,11 @@ async def fitgirl_rss_monitor():
                 print(f"⚠️ Error processing RSS post: {e}")
                 import traceback
                 traceback.print_exc()
+                # Still mark as seen to avoid retry loops
                 bot.seen_rss_posts.add(post['id'])
+                save_seen_posts()  # Save even on error
         
-        # Save seen posts
+        # Final save
         save_seen_posts()
         print("✅ RSS check complete")
         
@@ -1393,6 +1410,50 @@ async def auto_post_fitgirl_game(game_name: str, game_url: str, torrent_data: by
         import traceback
         traceback.print_exc()
 
+async def post_game_update(thread, title: str, game_url: str, paste_url: str):
+    """Post an update notification in an existing game thread."""
+    try:
+        # Extract version info if available
+        version_match = re.search(r'v?(\d+\.\d+(?:\.\d+)?)', title)
+        version = version_match.group(1) if version_match else "Unknown"
+        
+        update_embed = discord.Embed(
+            title="🔄 Game Updated!",
+            description=f"**{title}**",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        update_embed.add_field(name="📦 Version", value=version, inline=True)
+        update_embed.add_field(name="🔗 FitGirl Page", value=f"[View Update]({game_url})", inline=True)
+        
+        if paste_url:
+            update_embed.add_field(name="⬇️ Torrent", value=f"[Download]({paste_url})", inline=True)
+        
+        update_embed.set_footer(text="🤖 Auto-detected from RSS")
+        
+        # Send update notification in thread
+        await thread.send(embed=update_embed)
+        
+        # Notify users who have this game in their library
+        users_to_notify = []
+        for user_id, library in bot.user_libraries.items():
+            if thread.id in library:
+                users_to_notify.append(user_id)
+        
+        if users_to_notify:
+            # Send mentions in batches
+            mentions = [f"<@{user_id}>" for user_id in users_to_notify[:20]]  # Limit to 20 mentions
+            if mentions:
+                await thread.send(f"🔔 Update notification: {' '.join(mentions)}")
+        
+        print(f"✅ Posted update notification for: {title}")
+        
+    except Exception as e:
+        print(f"⚠️ Error posting game update: {e}")
+        import traceback
+        traceback.print_exc()
+
 # -------------------------
 # PING COMMAND
 # -------------------------
@@ -1439,6 +1500,18 @@ async def help_command(interaction: discord.Interaction):
             "`/latest [count]` - Show recently added games (default: 5)\n"
             "`/random` - Get a random game suggestion\n"
             "`/fgsearch <game>` - Search FitGirl Repacks\n"
+            "`/similar <game>` - Find similar games (IGDB)\n"
+        ),
+        inline=False
+    )
+    
+    # User Library Commands
+    embed.add_field(
+        name="📚 Your Library",
+        value=(
+            "`/mylibrary` - View your saved games\n"
+            "`/notify <game>` - Get notified when a game is added\n"
+            "React with 📚 on game posts to save them!\n"
         ),
         inline=False
     )
@@ -1448,6 +1521,18 @@ async def help_command(interaction: discord.Interaction):
         name="🎯 Game Requests",
         value=(
             "`/requestgame` - Request a game from moderators\n"
+            "`/toprequests` - See most voted requests\n"
+            "React with 👍 on requests to vote!\n"
+        ),
+        inline=False
+    )
+    
+    # Statistics Commands
+    embed.add_field(
+        name="📊 Statistics",
+        value=(
+            "`/stats` - View library statistics\n"
+            "`/downloadstats` - Most downloaded games\n"
         ),
         inline=False
     )
@@ -1469,9 +1554,11 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="💡 Tips",
         value=(
-            "• Use `/fgsearch` to find and auto-download FitGirl games\n"
-            "• Click the **⚠️ Report Issue** button on game posts to report problems\n"
-            "• Games are automatically posted from FitGirl RSS every 2 hours\n"
+            "• React with 📚 to save games to your library\n"
+            "• React with 👍 on requests to vote for them\n"
+            "• Use `/notify` to get pinged when specific games are added\n"
+            "• Game updates are auto-detected and posted in threads\n"
+            "• RSS auto-posts new games every 30 minutes\n"
         ),
         inline=False
     )

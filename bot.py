@@ -5554,6 +5554,22 @@ async def recommend(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Error: {e}")
 
 # -------------------------
+# LOAD MONITORING COG
+# -------------------------
+async def load_cogs():
+    """Load extension cogs."""
+    try:
+        await bot.load_extension('cogs.monitoring')
+        print("✅ Monitoring cog loaded")
+    except Exception as e:
+        print(f"⚠️ Failed to load monitoring cog: {e}")
+
+@bot.event
+async def setup_hook():
+    """Called when bot is starting up."""
+    await load_cogs()
+
+# -------------------------
 # RUN
 # -------------------------
 bot.run(TOKEN)

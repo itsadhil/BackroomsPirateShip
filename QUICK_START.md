@@ -9,11 +9,19 @@ Too long didn't read? Here's the lightning-fast version:
 
 ## 2️⃣ Create VM Instance
 - Click "Create VM Instance"
-- **Image:** Ubuntu 22.04
-- **Shape:** VM.Standard.A1.Flex (ARM Ampere)
-  - OCPUs: 2-4
-  - Memory: 12-24 GB
+- **Image:** Canonical Ubuntu 22.04 or 24.04
+- **Shape:** Click "Change Shape"
+  - **Click the "Ampere" tab** (not AMD!)
+  - Click **VM.Standard.A1.Flex** (shows "1 (80 max) OCPU")
+  - Move sliders:
+    - **OCPUs: 4** (use maximum free)
+    - **Memory: 24 GB** (use maximum free)
+  - Click "Select Shape"
+  - If no Ampere: Use **VM.Standard.E2.1.Micro** (AMD, 1GB RAM)
+- **Networking:** Keep defaults (create new VCN, assign public IP)
+- **Security:** Keep all defaults (encryption enabled)
 - **SSH Keys:** Generate and download both keys
+- **Advanced Options:** Skip it (leave all defaults)
 - Click "Create"
 - Wait for "RUNNING" status (green)
 - **Copy Public IP**

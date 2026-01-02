@@ -53,42 +53,104 @@ or anything you like
 
 #### **Image and Shape** (MOST IMPORTANT PART)
 
-**Option A: ARM Ampere (RECOMMENDED - Better specs)**
+**STEP 1: Change Image**
 1. Click **"Change Image"**
-   - Select **"Canonical Ubuntu"** (22.04 or latest)
-   - Click **"Select Image"**
+2. Select **"Canonical Ubuntu"** (22.04 or 24.04)
+3. Click **"Select Image"**
 
-2. Click **"Change Shape"**
-   - Select **"Ampere"** (not AMD)
-   - Choose **"VM.Standard.A1.Flex"**
-   - Set:
-     - **OCPUs:** 2 (or up to 4)
-     - **Memory (GB):** 12 (or up to 24)
-   - Click **"Select Shape"**
+**STEP 2: Change Shape**
+1. Click **"Change Shape"**
+2. **IMPORTANT:** Click on the **"Ampere"** tab at the top (NOT AMD or Intel)
+   - You'll see tabs: AMD | Intel | **Ampere** | Specialty
+   - Click the **Ampere** tab
+3. You'll see **"VM.Standard.A1.Flex"** with "Always Free-eligible" badge
+   - It shows: 1 (80 max) OCPU and 6 (512 max) Memory
+   - **Click on it** to select it
+4. Now you'll see sliders to configure resources:
+   - **Number of OCPUs:** Move slider to **4** (free tier allows up to 4 total)
+   - **Amount of memory (GB):** Move slider to **24** (free tier allows up to 24 GB total)
+   - These are the maximum free amounts - use them all!
+5. Click **"Select Shape"** button at the bottom
 
-**Option B: AMD (Simpler)**
-1. Image: **Canonical Ubuntu 22.04**
-2. Shape: **VM.Standard.E2.1.Micro** (Always Free)
+**⚠️ Can't Find Ampere?**
+- If you don't see the Ampere tab, your region might not have capacity
+- Try a different region OR use AMD option below:
+
+**Option B: AMD (Less powerful but works)**
+1. Stay on **AMD** tab
+2. Select **"VM.Standard.E2.1.Micro"** (marked "Always Free-eligible")
+   - 1 OCPU, 1 GB RAM
+3. Click **"Select Shape"**
+
+**❌ DO NOT SELECT:**
+- VM.Standard.E3.Flex (costs money)
+- VM.Standard.E2.2 or higher (costs money)
+- Anything without "Always Free-eligible" badge
 
 #### **Networking**
-- ✅ Keep **"Create new virtual cloud network"** checked
-- ✅ Keep **"Assign a public IPv4 address"** checked
-- Leave everything else default
+
+**Primary VNIC:**
+- **VNIC name:** Leave as "Primary network" (default)
+- **Virtual cloud network:** Select **"Create new virtual cloud network"** (should be default)
+- **Virtual cloud network compartment:** Leave as your root compartment
+- **Subnet:** Select **"Create new public subnet"** (should be default)
+- **Subnet compartment:** Leave as your root compartment
+
+**Private IPv4 address assignment:**
+- ✅ Keep **"Automatically assign private IPv4 address"** (default)
+
+**Public IPv4 address assignment:**
+- ✅ Keep **"Automatically assign public IPv4 address"** checked (IMPORTANT!)
+- This is what gives your bot internet access
+
+**IPv6 address assignment:**
+- ❌ Leave **unchecked** (you don't need IPv6)
+
+**Advanced options (in Networking):**
+- Skip it, leave defaults
+
+#### **Security** 
+- **Boot volume encryption:** Leave enabled (default)
+- **Use in-transit encryption:** Leave enabled (default) 
+- **Shielded instance:** Leave as default
+- **Secure boot, measured boot, trusted platform module:** Keep defaults
+
+**These security settings are fine as-is - don't change them!**
 
 #### **Add SSH Keys** (VERY IMPORTANT)
 
-**Windows Users:**
-1. Click **"Generate a key pair for me"**
-2. Click **"Save Private Key"** → Save to `C:\Users\YourName\.ssh\oracle-key`
-3. Click **"Save Public Key"** → Save to `C:\Users\YourName\.ssh\oracle-key.pub`
+You'll see three options - choose the first one:
 
-**Note:** Remember where you saved these files!
+**Option 1: Generate a key pair for me** (RECOMMENDED)
+1. ✅ Click **"Generate a key pair for me"** (easiest option)
+2. Click **"Download private key"** → Save as `oracle-key` to a safe place
+   - Example: `C:\Users\YourName\.ssh\oracle-key`
+   - **IMPORTANT:** Don't lose this file! You need it to connect!
+3. Click **"Download public key"** → Save as `oracle-key.pub` (same folder)
+   - Example: `C:\Users\YourName\.ssh\oracle-key.pub`
+
+**Remember where you saved these files! You'll need the private key to connect via SSH.**
+
+**Other options (if you know what you're doing):**
+- ❌ Upload public key file - If you already have SSH keys
+- ❌ Paste public key - If you want to paste your existing public key
+- ❌ No SSH keys - Don't choose this! You won't be able to connect!
 
 #### **Boot Volume**
 - Leave default (50GB is free)
 
+#### **Advanced Options** (SKIP - Use Defaults)
+You'll see "Show advanced options" at the bottom. **You can ignore this section** - all defaults are fine for a Discord bot:
+- ❌ Management → Instance metadata service: Leave default
+- ❌ Initialization script: Not needed (we'll setup after)
+- ❌ Tagging: Optional, skip it
+- ❌ Availability configuration: Defaults are fine
+- ❌ Oracle Cloud Agent: Leave plugins enabled (default)
+
+**Just skip the entire Advanced Options section!**
+
 ### 2.3 Create Instance
-1. Click **"Create"** button (bottom)
+1. Click **"Create"** button (bottom of page)
 2. Wait 2-3 minutes for provisioning
 3. Status will change from **"PROVISIONING"** to **"RUNNING"** (green)
 

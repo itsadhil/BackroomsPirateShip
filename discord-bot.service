@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord Pirate Ship Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/BackroomsPirateShip
+Environment="PATH=/home/ubuntu/BackroomsPirateShip/venv/bin:/usr/bin"
+ExecStart=/home/ubuntu/BackroomsPirateShip/venv/bin/python3 /home/ubuntu/BackroomsPirateShip/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

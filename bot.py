@@ -788,7 +788,7 @@ async def on_ready():
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
     if rss_enabled and not fitgirl_rss_monitor.is_running():
         fitgirl_rss_monitor.start()
-        print(f"✅ FitGirl RSS Monitor started (checking every 2 hours)")
+        print(f"✅ FitGirl RSS Monitor started (checking every 30 minutes)")
     else:
         print(f"⚠️ RSS Auto-posting disabled (set ENABLE_RSS_AUTO=true to enable)")
     
@@ -853,7 +853,7 @@ async def before_queue_processor():
 # =========================================================
 # FITGIRL RSS MONITOR (AUTO-POST NEW RELEASES)
 # =========================================================
-@tasks.loop(minutes=120)  # Check every 2 hours (reduced for free tier)
+@tasks.loop(minutes=30)  # Check every 30 minutes for new releases
 async def fitgirl_rss_monitor():
     """Monitor FitGirl RSS feed for new releases and auto-post them."""
     try:
@@ -874,7 +874,7 @@ async def fitgirl_rss_monitor():
         feed = feedparser.parse(rss_content)
         
         new_posts = []
-        for entry in feed.entries[:5]:  # Check last 5 entries
+        for entry in feed.entries[:10]:  # Check last 10 entries for better coverage
             post_id = entry.get('id') or entry.get('link')
             
             # Skip if already seen
@@ -1227,14 +1227,19 @@ async def auto_post_fitgirl_game(game_name: str, game_url: str, torrent_data: by
             view = GameButtonView(game_url, public_torrent_url)
             await starter_message.edit(view=view if view.children else None)
         
-        # Log to input channel
-        await input_channel.send(
-            f"📥 **New Game Auto-Posted** (FitGirl RSS)\n"
-            f"🤖 **Posted By:** RSS Monitor\n"
-            f"🎮 **Game:** {game_name}\n"
-            f"🔗 **Source:** {game_url}\n"
-            f"📦 **Thread:** {thread.thread.mention}"
+        # Log to input channel with embed
+        log_embed = discord.Embed(
+            title="📥 New Game Auto-Posted",
+            description=f"**{game_name}**",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
         )
+        log_embed.add_field(name="🤖 Posted By", value="RSS Monitor", inline=True)
+        log_embed.add_field(name="📦 Thread", value=thread.thread.mention, inline=True)
+        log_embed.add_field(name="🔗 Source", value=f"[FitGirl Page]({game_url})", inline=False)
+        log_embed.set_footer(text="FitGirl RSS Auto-Poster")
+        
+        await input_channel.send(embed=log_embed)
         
         # Track RSS bot as contributor
         if bot.user.id not in bot.contributor_stats:

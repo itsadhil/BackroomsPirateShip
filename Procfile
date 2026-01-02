@@ -1,2 +1,1 @@
-release: python install_playwright.py
-worker: python bot.py
+worker: python install_playwright.py && python bot.py

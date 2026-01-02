@@ -49,6 +49,10 @@ bot.seen_rss_posts = set()  # Track seen FitGirl RSS posts
 bot.dashboard_message_id = None  # Track dashboard message for updates
 bot.contributor_stats = {}  # Track who added what games
 bot.status_message_id = None  # Track bot status message
+bot.download_stats = {}  # Track download counts per game (thread_id: count)
+bot.user_libraries = {}  # Track user game libraries (user_id: [thread_ids])
+bot.game_notifications = {}  # Track notification requests (game_name: [user_ids])
+bot.request_votes = {}  # Track votes on requests (message_id: [user_ids])
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -58,6 +62,7 @@ bot.queue_position = {}  # Track position in queue for users
 # Files for persistent storage
 RSS_SEEN_FILE = "fitgirl_seen_posts.json"
 BOT_STATE_FILE = "bot_state.json"
+USER_DATA_FILE = "user_data.json"
 
 # Load previously seen posts
 def load_seen_posts():
@@ -102,6 +107,35 @@ def save_bot_state():
         print(f"💾 Bot state saved (Dashboard: {bot.dashboard_message_id})")
     except Exception as e:
         print(f"⚠️ Could not save bot state: {e}")
+
+def load_user_data():
+    """Load user-related data (libraries, notifications, votes, download stats)."""
+    try:
+        if os.path.exists(USER_DATA_FILE):
+            with open(USER_DATA_FILE, 'r') as f:
+                data = json.load(f)
+                bot.download_stats = {int(k): v for k, v in data.get('download_stats', {}).items()}
+                bot.user_libraries = {int(k): v for k, v in data.get('user_libraries', {}).items()}
+                bot.game_notifications = data.get('game_notifications', {})
+                bot.request_votes = {int(k): v for k, v in data.get('request_votes', {}).items()}
+                print(f"✅ Loaded user data (Libraries: {len(bot.user_libraries)}, Notifications: {len(bot.game_notifications)})")
+    except Exception as e:
+        print(f"⚠️ Could not load user data: {e}")
+
+def save_user_data():
+    """Save user-related data."""
+    try:
+        data = {
+            'download_stats': {str(k): v for k, v in bot.download_stats.items()},
+            'user_libraries': {str(k): v for k, v in bot.user_libraries.items()},
+            'game_notifications': bot.game_notifications,
+            'request_votes': {str(k): v for k, v in bot.request_votes.items()},
+            'last_updated': discord.utils.utcnow().isoformat()
+        }
+        with open(USER_DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save user data: {e}")
 
 async def update_status_message(status: str):
     """Update or create the bot status message."""
@@ -227,6 +261,48 @@ class IGDBClient:
         except Exception as e:
             print(f"⚠️ IGDB search error: {e}")
             return None
+    
+    async def get_similar_games(self, game_id: int) -> List[Dict[str, Any]]:
+        """Get similar games from IGDB."""
+        try:
+            await self.get_access_token()
+            
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            url = "https://api.igdb.com/v4/games"
+            headers = {
+                "Client-ID": self.client_id,
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            
+            # Get similar games based on the game
+            query = f'''
+            fields name, cover.image_id, aggregated_rating, genres.name, similar_games;
+            where id = {game_id};
+            '''
+            
+            async with self.session.post(url, headers=headers, data=query) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and data[0].get('similar_games'):
+                        similar_ids = data[0]['similar_games'][:10]
+                        
+                        # Fetch details of similar games
+                        query2 = f'''
+                        fields name, cover.image_id, aggregated_rating, genres.name;
+                        where id = ({','.join(map(str, similar_ids))});
+                        limit 10;
+                        '''
+                        
+                        async with self.session.post(url, headers=headers, data=query2) as resp2:
+                            if resp2.status == 200:
+                                return await resp2.json()
+            
+            return []
+        except Exception as e:
+            print(f"⚠️ IGDB similar games error: {e}")
+            return []
     
     async def close(self):
         """Close the aiohttp session."""
@@ -781,6 +857,7 @@ async def on_ready():
     # FIRST: Load persistent data to get the previous status_message_id
     load_seen_posts()
     load_bot_state()
+    load_user_data()
     
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
@@ -820,6 +897,53 @@ async def on_close():
     await igdb_client.close()
     save_seen_posts()
     save_bot_state()
+    save_user_data()
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """Handle reactions for library additions and request votes."""
+    # Ignore bot reactions
+    if payload.user_id == bot.user.id:
+        return
+    
+    # Handle library additions (📚 emoji on forum posts)
+    if str(payload.emoji) == "📚":
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if payload.channel_id == OUTPUT_CHANNEL_ID or (output_channel and payload.channel_id in [thread.id for thread in output_channel.threads]):
+            # Add to user's library
+            if payload.user_id not in bot.user_libraries:
+                bot.user_libraries[payload.user_id] = []
+            
+            if payload.channel_id not in bot.user_libraries[payload.user_id]:
+                bot.user_libraries[payload.user_id].append(payload.channel_id)
+                save_user_data()
+    
+    # Handle request votes (👍 emoji on requests)
+    elif str(payload.emoji) == "👍":
+        if payload.channel_id == REQUEST_CHANNEL_ID:
+            if payload.message_id not in bot.request_votes:
+                bot.request_votes[payload.message_id] = []
+            
+            if payload.user_id not in bot.request_votes[payload.message_id]:
+                bot.request_votes[payload.message_id].append(payload.user_id)
+                save_user_data()
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    """Handle reaction removal for library and votes."""
+    # Handle library removal
+    if str(payload.emoji) == "📚":
+        if payload.user_id in bot.user_libraries:
+            if payload.channel_id in bot.user_libraries[payload.user_id]:
+                bot.user_libraries[payload.user_id].remove(payload.channel_id)
+                save_user_data()
+    
+    # Handle vote removal
+    elif str(payload.emoji) == "👍":
+        if payload.message_id in bot.request_votes:
+            if payload.user_id in bot.request_votes[payload.message_id]:
+                bot.request_votes[payload.message_id].remove(payload.user_id)
+                save_user_data()
 
 # =========================================================
 # PLAYWRIGHT QUEUE PROCESSOR
@@ -1494,6 +1618,11 @@ async def stats(interaction: discord.Interaction):
     
     total_games = active_games + archived_games
     
+    # Calculate download stats
+    total_downloads = sum(bot.download_stats.values())
+    total_users_with_libraries = len(bot.user_libraries)
+    total_notifications = sum(len(users) for users in bot.game_notifications.values())
+    
     # Create stats embed
     embed = discord.Embed(
         title="📊 Game Library Statistics",
@@ -1517,6 +1646,37 @@ async def stats(interaction: discord.Interaction):
         value=f"**{archived_games:,}**",
         inline=True
     )
+    
+    embed.add_field(
+        name="⬇️ Total Downloads",
+        value=f"**{total_downloads:,}**",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="📚 Users with Libraries",
+        value=f"**{total_users_with_libraries:,}**",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🔔 Active Notifications",
+        value=f"**{total_notifications:,}**",
+        inline=True
+    )
+    
+    # Top contributors
+    if bot.contributor_stats:
+        top_contributors = sorted(bot.contributor_stats.items(), key=lambda x: x[1], reverse=True)[:3]
+        contributors_text = []
+        for user_id, count in top_contributors:
+            user = await bot.fetch_user(user_id)
+            contributors_text.append(f"• {user.mention} - {count} games")
+        embed.add_field(
+            name="👑 Top Contributors",
+            value="\n".join(contributors_text) if contributors_text else "No data",
+            inline=False
+        )
     
     embed.set_footer(text=f"Forum: {output_channel.name}")
     embed.timestamp = discord.utils.utcnow()
@@ -3370,6 +3530,200 @@ async def addgame(interaction: discord.Interaction):
         view=view,
         ephemeral=True
     )
+
+# =========================================================
+# USER LIBRARY COMMANDS
+# =========================================================
+@bot.tree.command(name="mylibrary", description="View your game library")
+async def mylibrary(interaction: discord.Interaction):
+    """Show user's saved games."""
+    if not await check_command_permissions(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    
+    user_id = interaction.user.id
+    library = bot.user_libraries.get(user_id, [])
+    
+    if not library:
+        await interaction.followup.send("📚 Your library is empty! React with 📚 on game posts to add them.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"📚 {interaction.user.display_name}'s Library",
+        description=f"You have **{len(library)}** games saved",
+        color=discord.Color.blue()
+    )
+    
+    # Get thread names
+    output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+    games_list = []
+    
+    for thread_id in library[:25]:  # Show first 25
+        try:
+            thread = output_channel.get_thread(thread_id)
+            if not thread:
+                # Try to fetch archived thread
+                thread = await output_channel.fetch_channel(thread_id)
+            if thread:
+                games_list.append(f"• {thread.mention}")
+        except:
+            pass
+    
+    if games_list:
+        embed.add_field(name="🎮 Your Games", value="\n".join(games_list), inline=False)
+    
+    if len(library) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(library)} games")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="notify", description="Get notified when a specific game is added")
+async def notify(interaction: discord.Interaction, game_name: str):
+    """Register for notifications when a game is posted."""
+    if not await check_command_permissions(interaction):
+        return
+    
+    game_name_lower = game_name.lower().strip()
+    
+    if game_name_lower not in bot.game_notifications:
+        bot.game_notifications[game_name_lower] = []
+    
+    if interaction.user.id in bot.game_notifications[game_name_lower]:
+        await interaction.response.send_message(
+            f"🔔 You're already subscribed to notifications for **{game_name}**",
+            ephemeral=True
+        )
+        return
+    
+    bot.game_notifications[game_name_lower].append(interaction.user.id)
+    save_user_data()
+    
+    await interaction.response.send_message(
+        f"✅ You'll be notified when **{game_name}** is added to the library!",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="similar", description="Find games similar to a specific game")
+async def similar(interaction: discord.Interaction, game_name: str):
+    """Find similar games using IGDB."""
+    if not await check_command_permissions(interaction):
+        return
+    await interaction.response.defer()
+    
+    # Search for the game
+    game_data = await igdb_client.search_game_by_name(game_name)
+    
+    if not game_data:
+        await interaction.followup.send(f"❌ Could not find **{game_name}** in the database.", ephemeral=True)
+        return
+    
+    # Get similar games
+    similar_games = await igdb_client.get_similar_games(game_data.get('id'))
+    
+    if not similar_games:
+        await interaction.followup.send(f"❌ No similar games found for **{game_name}**.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"🎮 Games Similar to {game_data.get('name', game_name)}",
+        description="Based on genres, themes, and gameplay",
+        color=discord.Color.purple()
+    )
+    
+    games_list = []
+    for game in similar_games[:10]:
+        name = game.get('name', 'Unknown')
+        rating = game.get('aggregated_rating', 0)
+        if rating:
+            games_list.append(f"• **{name}** - {rating:.0f}% rating")
+        else:
+            games_list.append(f"• **{name}**")
+    
+    embed.add_field(name="📋 Recommendations", value="\n".join(games_list), inline=False)
+    embed.set_footer(text="Powered by IGDB")
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="toprequests", description="Show most requested games")
+async def toprequests(interaction: discord.Interaction):
+    """Show games with most votes."""
+    if not await check_command_permissions(interaction):
+        return
+    await interaction.response.defer()
+    
+    if not bot.request_votes:
+        await interaction.followup.send("📊 No voted requests yet!", ephemeral=True)
+        return
+    
+    # Sort by vote count
+    sorted_requests = sorted(bot.request_votes.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+    
+    embed = discord.Embed(
+        title="🔥 Most Requested Games",
+        description="Games with the most votes",
+        color=discord.Color.orange()
+    )
+    
+    request_channel = bot.get_channel(REQUEST_CHANNEL_ID)
+    
+    requests_list = []
+    for msg_id, voters in sorted_requests:
+        try:
+            message = await request_channel.fetch_message(msg_id)
+            # Extract game name from message
+            game_name = message.content.split("**Game:**")[1].split("\n")[0].strip() if "**Game:**" in message.content else "Unknown"
+            requests_list.append(f"• **{game_name}** - {len(voters)} votes")
+        except:
+            pass
+    
+    if requests_list:
+        embed.add_field(name="📋 Top Requests", value="\n".join(requests_list), inline=False)
+    else:
+        embed.description = "No requests found"
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="downloadstats", description="Show most downloaded games")
+async def downloadstats(interaction: discord.Interaction):
+    """Show download statistics."""
+    if not await check_command_permissions(interaction):
+        return
+    await interaction.response.defer()
+    
+    if not bot.download_stats:
+        await interaction.followup.send("📊 No download data yet!", ephemeral=True)
+        return
+    
+    # Sort by download count
+    sorted_downloads = sorted(bot.download_stats.items(), key=lambda x: x[1], reverse=True)[:10]
+    
+    embed = discord.Embed(
+        title="📊 Most Downloaded Games",
+        description="Top 10 games by download count",
+        color=discord.Color.gold()
+    )
+    
+    output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+    
+    games_list = []
+    for thread_id, count in sorted_downloads:
+        try:
+            thread = output_channel.get_thread(thread_id)
+            if not thread:
+                thread = await output_channel.fetch_channel(thread_id)
+            if thread:
+                games_list.append(f"• {thread.mention} - **{count:,}** downloads")
+        except:
+            pass
+    
+    if games_list:
+        embed.add_field(name="🔥 Trending", value="\n".join(games_list), inline=False)
+    else:
+        embed.description = "No download data available"
+    
+    embed.set_footer(text="Download count tracked from button clicks")
+    
+    await interaction.followup.send(embed=embed)
 
 # -------------------------
 # RUN

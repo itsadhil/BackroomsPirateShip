@@ -122,6 +122,14 @@ async def update_status_message(status: str):
                 timestamp=now
             )
             embed.set_footer(text="Backrooms Pirate Ship")
+        elif status == "starting":
+            embed = discord.Embed(
+                title="🟡 Bot Starting",
+                description=f"New build is being deployed, loading services...\n\n**Deploy Time:** {timestamp}",
+                color=discord.Color.yellow(),
+                timestamp=now
+            )
+            embed.set_footer(text="Backrooms Pirate Ship • Please wait...")
         elif status == "restarting":
             embed = discord.Embed(
                 title="🟡 Bot Restarting",
@@ -770,19 +778,19 @@ async def check_command_permissions(interaction: discord.Interaction) -> bool:
 # -------------------------
 @bot.event
 async def on_ready():
+    # FIRST: Load persistent data to get the previous status_message_id
+    load_seen_posts()
+    load_bot_state()
+    
+    # SECOND: Update status to show bot is starting (will edit existing message if found)
+    await update_status_message("starting")
+    
     # Copy global commands to the guild for fast development
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
     print(f"✅ Logged in as {bot.user}")
     print(f"✅ Commands synced to guild ID: {GUILD_ID}")
-    
-    # Update status message
-    await update_status_message("online")
-    
-    # Load persistent data
-    load_seen_posts()
-    load_bot_state()
     
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
@@ -801,6 +809,9 @@ async def on_ready():
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
         print(f"✅ Playwright queue processor started")
+    
+    # LAST: Update status to online after everything is loaded
+    await update_status_message("online")
 
 @bot.event
 async def on_close():

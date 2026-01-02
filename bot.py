@@ -48,6 +48,7 @@ bot.pending_fulfillments = {}  # Store pending request fulfillments
 bot.seen_rss_posts = set()  # Track seen FitGirl RSS posts
 bot.dashboard_message_id = None  # Track dashboard message for updates
 bot.contributor_stats = {}  # Track who added what games
+bot.status_message_id = None  # Track bot status message
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -83,6 +84,7 @@ def load_bot_state():
                 state = json.load(f)
                 bot.dashboard_message_id = state.get('dashboard_message_id')
                 bot.contributor_stats = state.get('contributor_stats', {})
+                bot.status_message_id = state.get('status_message_id')
                 print(f"✅ Loaded bot state (Dashboard ID: {bot.dashboard_message_id}, Contributors: {len(bot.contributor_stats)})")
     except Exception as e:
         print(f"⚠️ Could not load bot state: {e}")
@@ -92,6 +94,7 @@ def save_bot_state():
         state = {
             'dashboard_message_id': bot.dashboard_message_id,
             'contributor_stats': bot.contributor_stats,
+            'status_message_id': bot.status_message_id,
             'last_updated': discord.utils.utcnow().isoformat()
         }
         with open(BOT_STATE_FILE, 'w') as f:
@@ -99,6 +102,58 @@ def save_bot_state():
         print(f"💾 Bot state saved (Dashboard: {bot.dashboard_message_id})")
     except Exception as e:
         print(f"⚠️ Could not save bot state: {e}")
+
+async def update_status_message(status: str):
+    """Update or create the bot status message."""
+    try:
+        channel = bot.get_channel(DASHBOARD_CHANNEL_ID)
+        if not channel:
+            print(f"⚠️ Could not find dashboard channel {DASHBOARD_CHANNEL_ID}")
+            return
+        
+        now = discord.utils.utcnow()
+        timestamp = f"<t:{int(now.timestamp())}:F>"
+        
+        if status == "online":
+            embed = discord.Embed(
+                title="🟢 Bot Online",
+                description=f"Bot is now online and ready to serve!\n\n**Started:** {timestamp}",
+                color=discord.Color.green(),
+                timestamp=now
+            )
+            embed.set_footer(text="Backrooms Pirate Ship")
+        elif status == "restarting":
+            embed = discord.Embed(
+                title="🟡 Bot Restarting",
+                description=f"New build is being deployed, please wait...\n\n**Triggered:** {timestamp}",
+                color=discord.Color.yellow(),
+                timestamp=now
+            )
+            embed.set_footer(text="Backrooms Pirate Ship")
+        else:
+            return
+        
+        # Try to edit existing message, or create new one
+        if bot.status_message_id:
+            try:
+                message = await channel.fetch_message(bot.status_message_id)
+                await message.edit(embed=embed)
+                print(f"✅ Updated status message to: {status}")
+                return
+            except discord.NotFound:
+                print(f"⚠️ Previous status message not found, creating new one")
+                bot.status_message_id = None
+            except Exception as e:
+                print(f"⚠️ Could not edit status message: {e}")
+        
+        # Create new message if needed
+        message = await channel.send(embed=embed)
+        bot.status_message_id = message.id
+        save_bot_state()
+        print(f"✅ Created new status message: {status}")
+        
+    except Exception as e:
+        print(f"⚠️ Error updating status message: {e}")
 
 # =========================================================
 # IGDB API CLIENT
@@ -722,6 +777,9 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     print(f"✅ Commands synced to guild ID: {GUILD_ID}")
     
+    # Update status message
+    await update_status_message("online")
+    
     # Load persistent data
     load_seen_posts()
     load_bot_state()
@@ -747,6 +805,7 @@ async def on_ready():
 @bot.event
 async def on_close():
     """Clean up resources on bot shutdown."""
+    await update_status_message("restarting")
     await igdb_client.close()
     save_seen_posts()
     save_bot_state()

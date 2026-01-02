@@ -57,6 +57,7 @@ bot.game_reviews = {}  # Track game reviews (thread_id: [{user_id, rating, revie
 bot.game_tags = {}  # Track game tags (thread_id: [tags])
 bot.link_health = {}  # Track link health (thread_id: {checked_at, status, broken_links})
 bot.trending_views = {}  # Track thread views for trending (thread_id: view_count)
+bot.webhooks = {}  # Track webhook URLs (user_id: webhook_url)
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -70,6 +71,7 @@ USER_DATA_FILE = "user_data.json"
 REVIEWS_FILE = "reviews_data.json"
 TAGS_FILE = "tags_data.json"
 HEALTH_FILE = "link_health_data.json"
+WEBHOOKS_FILE = "webhooks_data.json"
 
 # Load previously seen posts
 def load_seen_posts():
@@ -199,6 +201,24 @@ def save_health_data():
             json.dump({str(k): v for k, v in bot.link_health.items()}, f, indent=2)
     except Exception as e:
         print(f"⚠️ Could not save health data: {e}")
+
+def load_webhooks_data():
+    """Load webhooks data."""
+    try:
+        if os.path.exists(WEBHOOKS_FILE):
+            with open(WEBHOOKS_FILE, 'r') as f:
+                bot.webhooks = {int(k): v for k, v in json.load(f).items()}
+                print(f"✅ Loaded {len(bot.webhooks)} webhooks")
+    except Exception as e:
+        print(f"⚠️ Could not load webhooks data: {e}")
+
+def save_webhooks_data():
+    """Save webhooks data."""
+    try:
+        with open(WEBHOOKS_FILE, 'w') as f:
+            json.dump({str(k): v for k, v in bot.webhooks.items()}, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Could not save webhooks data: {e}")
 
 async def update_status_message(status: str):
     """Update or create the bot status message."""
@@ -366,6 +386,59 @@ class IGDBClient:
         except Exception as e:
             print(f"⚠️ IGDB similar games error: {e}")
             return []
+    
+    async def get_game_videos(self, game_id: int) -> List[str]:
+        """Get YouTube video IDs for game trailers."""
+        try:
+            await self.get_access_token()
+            
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            url = "https://api.igdb.com/v4/game_videos"
+            headers = {
+                "Client-ID": self.client_id,
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            
+            query = f'fields video_id; where game = {game_id}; limit 5;'
+            
+            async with self.session.post(url, headers=headers, data=query) as resp:
+                if resp.status == 200:
+                    videos = await resp.json()
+                    return [v.get('video_id') for v in videos if v.get('video_id')]
+            
+            return []
+        except Exception as e:
+            print(f"⚠️ IGDB videos error: {e}")
+            return []
+    
+    async def get_external_ratings(self, game_id: int) -> Dict[str, Any]:
+        """Get external ratings like Metacritic."""
+        try:
+            await self.get_access_token()
+            
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            url = "https://api.igdb.com/v4/games"
+            headers = {
+                "Client-ID": self.client_id,
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            
+            query = f'fields aggregated_rating, aggregated_rating_count, rating, rating_count; where id = {game_id};'
+            
+            async with self.session.post(url, headers=headers, data=query) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data:
+                        return data[0]
+            
+            return {}
+        except Exception as e:
+            print(f"⚠️ IGDB ratings error: {e}")
+            return {}
     
     async def close(self):
         """Close the aiohttp session."""
@@ -924,6 +997,7 @@ async def on_ready():
     load_reviews_data()
     load_tags_data()
     load_health_data()
+    load_webhooks_data()
     
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
@@ -953,6 +1027,11 @@ async def on_ready():
         link_health_monitor.start()
         print(f"✅ Link health monitor started (checks daily)")
     
+    # Start auto-backup
+    if not auto_backup.is_running():
+        auto_backup.start()
+        print(f"✅ Auto-backup started (runs daily)")
+    
     # Start Playwright queue processor
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
@@ -972,6 +1051,7 @@ async def on_close():
     save_reviews_data()
     save_tags_data()
     save_health_data()
+    save_webhooks_data()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -1457,6 +1537,58 @@ async def before_health_monitor():
     await bot.wait_until_ready()
 
 # =========================================================
+# AUTO-BACKUP SYSTEM
+# =========================================================
+@tasks.loop(hours=24)  # Backup daily
+async def auto_backup():
+    """Automatically backup bot data daily."""
+    try:
+        import zipfile
+        from datetime import datetime
+        
+        print("💾 Starting auto-backup...")
+        
+        # Create backup filename with timestamp
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"backups/backup_{timestamp}.zip"
+        
+        # Create backups directory if it doesn't exist
+        os.makedirs("backups", exist_ok=True)
+        
+        # Files to backup
+        files_to_backup = [
+            RSS_SEEN_FILE,
+            BOT_STATE_FILE,
+            USER_DATA_FILE,
+            REVIEWS_FILE,
+            TAGS_FILE,
+            HEALTH_FILE
+        ]
+        
+        # Create zip file
+        with zipfile.ZipFile(backup_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for filename in files_to_backup:
+                if os.path.exists(filename):
+                    zipf.write(filename)
+        
+        print(f"✅ Auto-backup created: {backup_filename}")
+        
+        # Keep only last 7 backups
+        import glob
+        backups = sorted(glob.glob("backups/backup_*.zip"))
+        if len(backups) > 7:
+            for old_backup in backups[:-7]:
+                os.remove(old_backup)
+                print(f"🗑️ Removed old backup: {old_backup}")
+        
+    except Exception as e:
+        print(f"⚠️ Error in auto-backup: {e}")
+
+@auto_backup.before_loop
+async def before_auto_backup():
+    await bot.wait_until_ready()
+
+# =========================================================
 # AUTO-POST FITGIRL GAME FROM RSS
 # =========================================================
 async def auto_post_fitgirl_game(game_name: str, game_url: str, torrent_data: bytes, details: Dict[str, Any]):
@@ -1580,6 +1712,12 @@ async def auto_post_fitgirl_game(game_name: str, game_url: str, torrent_data: by
         log_embed.set_footer(text="FitGirl RSS Auto-Poster")
         
         await input_channel.send(embed=log_embed)
+        
+        # Send webhook notifications
+        try:
+            await send_webhook_notifications(log_embed, game_name)
+        except:
+            pass
         
         # Track RSS bot as contributor
         if bot.user.id not in bot.contributor_stats:
@@ -4595,6 +4733,327 @@ async def checkhealth(interaction: discord.Interaction):
         # Run the health check
         await link_health_monitor()
         await interaction.followup.send("✅ Link health check complete! Use `/linkhealth` to view results.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+# -------------------------
+# NEW FEATURES - TRAILERS & RATINGS
+# -------------------------
+@bot.tree.command(name="trailer", description="View trailer for a game")
+@discord.app_commands.describe(game="Name of the game")
+async def trailer(interaction: discord.Interaction, game: str):
+    """Get YouTube trailer for a game."""
+    await interaction.response.defer()
+    
+    try:
+        # Search for game on IGDB
+        clean_name = clean_game_name_for_search(game)
+        igdb_data = await igdb_client.search_game_by_name(clean_name)
+        
+        if not igdb_data:
+            await interaction.followup.send(f"❌ Could not find game data for '{game}'")
+            return
+        
+        game_id = igdb_data.get('id')
+        if not game_id:
+            await interaction.followup.send(f"❌ Could not find game ID for '{game}'")
+            return
+        
+        # Get videos
+        video_ids = await igdb_client.get_game_videos(game_id)
+        
+        if not video_ids:
+            await interaction.followup.send(f"📹 No trailers found for **{igdb_data['name']}**")
+            return
+        
+        embed = discord.Embed(
+            title=f"🎬 Trailers for {igdb_data['name']}",
+            description=f"Found {len(video_ids)} trailer(s)",
+            color=discord.Color.red()
+        )
+        
+        # Add YouTube links
+        for idx, video_id in enumerate(video_ids[:3], 1):
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+            embed.add_field(
+                name=f"Trailer #{idx}",
+                value=f"[Watch on YouTube]({youtube_url})",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="gameinfo", description="View detailed game information with ratings")
+@discord.app_commands.describe(game="Name of the game")
+async def gameinfo(interaction: discord.Interaction, game: str):
+    """Get detailed game information including ratings."""
+    await interaction.response.defer()
+    
+    try:
+        # Search for game on IGDB
+        clean_name = clean_game_name_for_search(game)
+        igdb_data = await igdb_client.search_game_by_name(clean_name)
+        
+        if not igdb_data:
+            await interaction.followup.send(f"❌ Could not find game data for '{game}'")
+            return
+        
+        game_id = igdb_data.get('id')
+        game_name = igdb_data.get('name', 'Unknown')
+        
+        # Get ratings
+        ratings_data = await igdb_client.get_external_ratings(game_id) if game_id else {}
+        
+        # Get videos
+        video_ids = await igdb_client.get_game_videos(game_id) if game_id else []
+        
+        embed = discord.Embed(
+            title=f"🎮 {game_name}",
+            description=igdb_data.get('summary', 'No description available')[:500],
+            color=discord.Color.blue()
+        )
+        
+        # Add cover image
+        cover = igdb_data.get('cover')
+        if cover and cover.get('image_id'):
+            image_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{cover['image_id']}.jpg"
+            embed.set_thumbnail(url=image_url)
+        
+        # Add genres
+        genres = igdb_data.get('genres', [])
+        if genres:
+            genre_names = [g['name'] for g in genres]
+            embed.add_field(name="🎭 Genres", value=", ".join(genre_names), inline=True)
+        
+        # Add platforms
+        platforms = igdb_data.get('platforms', [])
+        if platforms:
+            platform_names = [p['name'] for p in platforms[:5]]
+            embed.add_field(name="🎮 Platforms", value=", ".join(platform_names), inline=True)
+        
+        # Add ratings
+        if ratings_data:
+            agg_rating = ratings_data.get('aggregated_rating')
+            if agg_rating:
+                embed.add_field(
+                    name="⭐ Critics Score",
+                    value=f"{agg_rating:.1f}/100",
+                    inline=True
+                )
+            
+            user_rating = ratings_data.get('rating')
+            if user_rating:
+                embed.add_field(
+                    name="👥 User Score",
+                    value=f"{user_rating:.1f}/100",
+                    inline=True
+                )
+        
+        # Add our community rating
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if output_channel:
+            for thread in output_channel.threads:
+                if clean_name.lower() in thread.name.lower():
+                    reviews = bot.game_reviews.get(thread.id, [])
+                    if reviews:
+                        avg = sum(r['rating'] for r in reviews) / len(reviews)
+                        embed.add_field(
+                            name="📝 Community Rating",
+                            value=f"{avg:.1f}/5.0 ⭐ ({len(reviews)} reviews)",
+                            inline=True
+                        )
+                    break
+        
+        # Add trailer link
+        if video_ids:
+            youtube_url = f"https://www.youtube.com/watch?v={video_ids[0]}"
+            embed.add_field(
+                name="🎬 Trailer",
+                value=f"[Watch on YouTube]({youtube_url})",
+                inline=False
+            )
+        
+        embed.set_footer(text="Data from IGDB")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# -------------------------
+# NEW FEATURES - WEBHOOKS & AUTO-BACKUP
+# -------------------------
+@bot.tree.command(name="backup", description="Create backup of bot data (Admin only)")
+async def backup(interaction: discord.Interaction):
+    """Create backup of all bot data."""
+    # Check if user has admin role
+    if ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+        await interaction.response.send_message("❌ You need admin role to create backups", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        import zipfile
+        from datetime import datetime
+        
+        # Create backup filename with timestamp
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"backup_{timestamp}.zip"
+        
+        # Files to backup
+        files_to_backup = [
+            RSS_SEEN_FILE,
+            BOT_STATE_FILE,
+            USER_DATA_FILE,
+            REVIEWS_FILE,
+            TAGS_FILE,
+            HEALTH_FILE
+        ]
+        
+        # Create zip file
+        with zipfile.ZipFile(backup_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for filename in files_to_backup:
+                if os.path.exists(filename):
+                    zipf.write(filename)
+        
+        # Send backup file
+        file = discord.File(backup_filename)
+        await interaction.followup.send(
+            f"✅ Backup created successfully!",
+            file=file,
+            ephemeral=True
+        )
+        
+        # Clean up temp file
+        os.remove(backup_filename)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error creating backup: {e}", ephemeral=True)
+
+@bot.tree.command(name="cleanup", description="Clean up broken game links (Admin only)")
+async def cleanup(interaction: discord.Interaction):
+    """Identify and report games with broken links that need attention."""
+    # Check if user has admin role
+    if ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+        await interaction.response.send_message("❌ You need admin role to run cleanup", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if not bot.link_health:
+            await interaction.followup.send("❌ No link health data available. Run `/checkhealth` first.", ephemeral=True)
+            return
+        
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        if not output_channel:
+            await interaction.followup.send("❌ Could not access the game library", ephemeral=True)
+            return
+        
+        # Find games with broken links
+        broken_games = []
+        for thread_id, health_data in bot.link_health.items():
+            if health_data['status'] == 'broken':
+                try:
+                    thread = await output_channel.fetch_channel(thread_id)
+                    if thread:
+                        broken_games.append({
+                            'thread': thread,
+                            'broken_count': len(health_data['broken_links']),
+                            'links': health_data['broken_links']
+                        })
+                except:
+                    pass
+        
+        if not broken_games:
+            await interaction.followup.send("✅ No games with broken links found!", ephemeral=True)
+            return
+        
+        # Create report
+        report = f"🔧 **Cleanup Report**\n\nFound {len(broken_games)} games with broken links:\n\n"
+        
+        for game_data in broken_games[:20]:
+            thread = game_data['thread']
+            report += f"• **{thread.name}** ({thread.mention})\n"
+            report += f"  └ {game_data['broken_count']} broken link(s)\n"
+        
+        if len(broken_games) > 20:
+            report += f"\n... and {len(broken_games) - 20} more"
+        
+        await interaction.followup.send(report[:2000], ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+# =========================================================
+# WEBHOOK NOTIFICATIONS HELPER
+# =========================================================
+async def send_webhook_notifications(embed: discord.Embed, game_name: str):
+    """Send webhook notifications to subscribed users."""
+    try:
+        for user_id, webhook_url in bot.webhooks.items():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    webhook = discord.Webhook.from_url(webhook_url, session=session)
+                    await webhook.send(
+                        content=f"**New Game Added:** {game_name}",
+                        embed=embed,
+                        username="Backrooms Pirate Ship"
+                    )
+            except Exception as e:
+                print(f"⚠️ Failed to send webhook to user {user_id}: {e}")
+    except Exception as e:
+        print(f"⚠️ Error in webhook notifications: {e}")
+
+# -------------------------
+# NEW FEATURES - WEBHOOK COMMANDS
+# -------------------------
+@bot.tree.command(name="setwebhook", description="Set a webhook URL to receive game notifications")
+@discord.app_commands.describe(webhook_url="Your Discord webhook URL")
+async def setwebhook(interaction: discord.Interaction, webhook_url: str):
+    """Set webhook for personal notifications."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Validate webhook URL
+        if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+            await interaction.followup.send("❌ Invalid webhook URL. Must be a Discord webhook.", ephemeral=True)
+            return
+        
+        # Test webhook
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(webhook_url, session=session)
+                await webhook.send("✅ Webhook setup successful! You'll receive notifications here.", username="Backrooms Pirate Ship")
+        except:
+            await interaction.followup.send("❌ Could not send test message to webhook. Check the URL.", ephemeral=True)
+            return
+        
+        # Save webhook
+        bot.webhooks[interaction.user.id] = webhook_url
+        save_webhooks_data()
+        
+        await interaction.followup.send("✅ Webhook configured successfully! You'll be notified of new games.", ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+@bot.tree.command(name="removewebhook", description="Remove your webhook subscription")
+async def removewebhook(interaction: discord.Interaction):
+    """Remove webhook subscription."""
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        if interaction.user.id in bot.webhooks:
+            del bot.webhooks[interaction.user.id]
+            save_webhooks_data()
+            await interaction.followup.send("✅ Webhook removed successfully.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ You don't have a webhook configured.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 

@@ -1008,11 +1008,13 @@ async def fitgirl_rss_monitor():
         # Parse RSS feed
         feed = feedparser.parse(rss_content)
         
+        output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+        
         new_posts = []
         for entry in feed.entries[:10]:  # Check last 10 entries for better coverage
             post_id = entry.get('id') or entry.get('link')
             
-            # Skip if already seen
+            # Skip if already seen in RSS
             if post_id in bot.seen_rss_posts:
                 continue
             
@@ -1021,8 +1023,40 @@ async def fitgirl_rss_monitor():
             if 'Updates Digest' in title or 'updates digest' in title.lower():
                 print(f"⏭️ Skipping Updates Digest: {title}")
                 bot.seen_rss_posts.add(post_id)
+                save_seen_posts()
                 continue
             
+            # CRITICAL: Check if game already exists in forum BEFORE adding to queue
+            clean_name = clean_game_name_for_search(title)
+            game_exists = False
+            
+            # Check active threads
+            for thread in output_channel.threads:
+                thread_clean = clean_game_name_for_search(thread.name)
+                if thread_clean.lower() == clean_name.lower():
+                    game_exists = True
+                    print(f"⏭️ Game already in forum (active): {title} -> {thread.name}")
+                    break
+            
+            # Check archived threads if not found in active
+            if not game_exists:
+                try:
+                    async for thread in output_channel.archived_threads(limit=200):
+                        thread_clean = clean_game_name_for_search(thread.name)
+                        if thread_clean.lower() == clean_name.lower():
+                            game_exists = True
+                            print(f"⏭️ Game already in forum (archived): {title} -> {thread.name}")
+                            break
+                except Exception as e:
+                    print(f"⚠️ Error checking archived threads: {e}")
+            
+            # If game exists, mark as seen and skip
+            if game_exists:
+                bot.seen_rss_posts.add(post_id)
+                save_seen_posts()
+                continue
+            
+            # Only add to processing queue if it's truly new
             new_posts.append({
                 'id': post_id,
                 'title': title,
@@ -1035,7 +1069,7 @@ async def fitgirl_rss_monitor():
             save_seen_posts()
             return
         
-        print(f"🆕 Found {len(new_posts)} new FitGirl release(s)!")
+        print(f"🆕 Found {len(new_posts)} new FitGirl release(s) to process!")
         
         # Process each new post
         for post in new_posts:
@@ -1047,6 +1081,7 @@ async def fitgirl_rss_monitor():
                 if not paste_url:
                     print(f"⚠️ No torrent link found for: {post['title']}")
                     bot.seen_rss_posts.add(post['id'])
+                    save_seen_posts()
                     continue
                 
                 # Check if game already exists in forum
@@ -1063,26 +1098,36 @@ async def fitgirl_rss_monitor():
                         print(f"✅ Found in active threads: {thread.name}")
                         break
                 
+                # Double-check if game exists (safety check for updates)
+                clean_name = clean_game_name_for_search(post['title'])
+                output_channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+                
+                existing_thread = None
+                
+                # FIRST: Check active threads
+                for thread in output_channel.threads:
+                    thread_clean = clean_game_name_for_search(thread.name)
+                    if thread_clean.lower() == clean_name.lower():
+                        existing_thread = thread
+                        break
+                
                 # SECOND: Check archived threads if not found
                 if not existing_thread:
                     async for thread in output_channel.archived_threads(limit=200):
                         thread_clean = clean_game_name_for_search(thread.name)
                         if thread_clean.lower() == clean_name.lower():
                             existing_thread = thread
-                            print(f"✅ Found in archived threads: {thread.name}")
                             break
                 
-                # If game exists, handle accordingly
+                # If game exists NOW (race condition check), it must be an update
                 if existing_thread:
                     # Check if the new post has version info suggesting it's an update
                     if 'update' in post['title'].lower() or re.search(r'v?\d+\.\d+', post['title']):
                         print(f"🔄 Detected update for: {clean_name}")
-                        # Post update notification in existing thread
                         await post_game_update(existing_thread, post['title'], post['link'], paste_url)
                     else:
-                        print(f"⏭️ Game already exists, skipping: {post['title']}")
+                        print(f"⏭️ Game appeared during processing, skipping: {post['title']}")
                     
-                    # Mark as seen and save immediately
                     bot.seen_rss_posts.add(post['id'])
                     save_seen_posts()
                     continue
@@ -1094,6 +1139,7 @@ async def fitgirl_rss_monitor():
                 if not torrent_data:
                     print(f"⚠️ Failed to download torrent for: {post['title']}")
                     bot.seen_rss_posts.add(post['id'])
+                    save_seen_posts()
                     continue
                 
                 # Get game details

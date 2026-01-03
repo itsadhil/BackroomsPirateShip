@@ -7149,6 +7149,28 @@ async def botstats(interaction: discord.Interaction):
 MINECRAFT_SERVICE = "minecraft-bedrock"
 MINECRAFT_DIR = "/home/ubuntu/minecraft-bedrock"
 
+async def is_minecraft_running():
+    """Check if Minecraft server is running (systemd or screen)"""
+    # Check systemd
+    check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+    result = await asyncio.create_subprocess_shell(
+        check_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await result.communicate()
+    if stdout.decode().strip() == "active":
+        return True
+    
+    # Check screen session
+    screen_check = await asyncio.create_subprocess_shell(
+        "screen -ls | grep minecraft",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    screen_out, _ = await screen_check.communicate()
+    return len(screen_out.decode().strip()) > 0
+
 @bot.tree.command(name="mcstart", description="Start the Minecraft Bedrock server (Admin only)")
 async def mcstart(interaction: discord.Interaction):
     """Start Minecraft server"""
@@ -7486,16 +7508,7 @@ async def mccommand(interaction: discord.Interaction, command: str):
     
     try:
         # Check if server is running
-        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
-        result = await asyncio.create_subprocess_shell(
-            check_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await result.communicate()
-        status = stdout.decode().strip()
-        
-        if status != "active":
+        if not await is_minecraft_running():
             await interaction.followup.send("❌ Server is not running!")
             return
         
@@ -7553,16 +7566,7 @@ async def mcplayers(interaction: discord.Interaction):
     
     try:
         # Check if server is running
-        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
-        result = await asyncio.create_subprocess_shell(
-            check_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await result.communicate()
-        status = stdout.decode().strip()
-        
-        if status != "active":
+        if not await is_minecraft_running():
             await interaction.followup.send("❌ Server is not running!")
             return
         
@@ -7731,16 +7735,7 @@ async def mcperf(interaction: discord.Interaction):
     
     try:
         # Check if server is running
-        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
-        result = await asyncio.create_subprocess_shell(
-            check_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await result.communicate()
-        status = stdout.decode().strip()
-        
-        if status != "active":
+        if not await is_minecraft_running():
             await interaction.followup.send("❌ Server is not running!")
             return
         

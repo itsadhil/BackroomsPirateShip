@@ -7149,6 +7149,11 @@ async def botstats(interaction: discord.Interaction):
 MINECRAFT_SERVICE = "minecraft-bedrock"
 MINECRAFT_DIR = "/home/ubuntu/minecraft-bedrock"
 
+# Live console tracking
+bot.mc_console_channel = None
+bot.mc_console_enabled = False
+bot.mc_last_log_line = None
+
 async def is_minecraft_running():
     """Check if Minecraft server is running (systemd or screen)"""
     # Check systemd
@@ -8002,6 +8007,148 @@ async def mcstats(interaction: discord.Interaction):
         
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcconsole", description="Start/stop live console streaming (Admin only)")
+async def mcconsole(interaction: discord.Interaction, action: str):
+    """Toggle live console streaming"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if action.lower() == "start":
+            bot.mc_console_channel = interaction.channel.id
+            bot.mc_console_enabled = True
+            
+            embed = discord.Embed(
+                title="🖥️ Live Console Started",
+                description=f"Server logs will stream to {interaction.channel.mention}",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="Features",
+                value="• Real-time log streaming\n• Player join/leave notifications\n• Command execution logs\n• Server events",
+                inline=False
+            )
+            embed.set_footer(text="Use /mcconsole stop to disable")
+            
+            await interaction.followup.send(embed=embed)
+            
+            # Start the streaming task if not running
+            if not minecraft_console_stream.is_running():
+                minecraft_console_stream.start()
+        
+        elif action.lower() == "stop":
+            bot.mc_console_enabled = False
+            bot.mc_console_channel = None
+            
+            embed = discord.Embed(
+                title="🖥️ Live Console Stopped",
+                description="Console streaming has been disabled",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+        
+        else:
+            await interaction.followup.send("❌ Action must be `start` or `stop`")
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@tasks.loop(seconds=5)
+async def minecraft_console_stream():
+    """Stream Minecraft console logs to Discord"""
+    try:
+        if not bot.mc_console_enabled or not bot.mc_console_channel:
+            return
+        
+        if not await is_minecraft_running():
+            return
+        
+        channel = bot.get_channel(bot.mc_console_channel)
+        if not channel:
+            return
+        
+        # Get recent logs
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} -n 5 --no-pager --since '10 seconds ago' 2>/dev/null || screen -S minecraft -X hardcopy /tmp/mc_screen.log && tail -n 5 /tmp/mc_screen.log"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        logs = stdout.decode().strip()
+        
+        if not logs or logs == bot.mc_last_log_line:
+            return
+        
+        bot.mc_last_log_line = logs
+        
+        # Parse logs for important events
+        lines = logs.split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+            
+            # Extract timestamp and message
+            if 'INFO]' in line:
+                msg = line.split('INFO]')[-1].strip()
+            else:
+                msg = line
+            
+            # Skip duplicate messages
+            if hasattr(bot, 'mc_last_messages') and msg in bot.mc_last_messages:
+                continue
+            
+            if not hasattr(bot, 'mc_last_messages'):
+                bot.mc_last_messages = []
+            
+            bot.mc_last_messages.append(msg)
+            if len(bot.mc_last_messages) > 50:
+                bot.mc_last_messages.pop(0)
+            
+            # Color code based on event type
+            color = None
+            emoji = "📋"
+            
+            if "Player connected:" in msg or "Player Spawned:" in msg:
+                color = discord.Color.green()
+                emoji = "✅"
+            elif "Player disconnected:" in msg:
+                color = discord.Color.red()
+                emoji = "❌"
+            elif "ERROR" in line.upper() or "WARN" in line.upper():
+                color = discord.Color.orange()
+                emoji = "⚠️"
+            elif "Server started" in msg:
+                color = discord.Color.blue()
+                emoji = "🟢"
+            elif "Stopping server" in msg or "Server stop" in msg:
+                color = discord.Color.red()
+                emoji = "🔴"
+            
+            # Create compact embed for important events
+            if color:
+                embed = discord.Embed(
+                    description=f"{emoji} {msg[:200]}",
+                    color=color,
+                    timestamp=discord.utils.utcnow()
+                )
+                await channel.send(embed=embed)
+            else:
+                # Regular log message in code block
+                if len(msg) > 150:
+                    msg = msg[:150] + "..."
+                await channel.send(f"```{msg}```")
+    
+    except Exception as e:
+        print(f"Error in console stream: {e}")
+
+@minecraft_console_stream.before_loop
+async def before_console_stream():
+    await bot.wait_until_ready()
 
 # -------------------------
 # LOAD MONITORING COG

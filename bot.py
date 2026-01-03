@@ -7747,21 +7747,32 @@ async def mcperf(interaction: discord.Interaction):
             stderr=asyncio.subprocess.PIPE
         )
         cpu_stdout, _ = await cpu_process.communicate()
-        cpu_usage = cpu_stdout.decode().strip() or "0"
+        cpu_usage = cpu_stdout.decode().strip().split('\n')[0] or "0"
         
         # Get memory usage
-        mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4, $6}}'"
+        mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4}}'"
         mem_process = await asyncio.create_subprocess_shell(
             mem_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         mem_stdout, _ = await mem_process.communicate()
-        mem_data = mem_stdout.decode().strip().split()
+        mem_percent = mem_stdout.decode().strip().split('\n')[0] or "0"
         
-        mem_percent = mem_data[0] if len(mem_data) > 0 else "0"
-        mem_kb = mem_data[1] if len(mem_data) > 1 else "0"
-        mem_mb = f"{int(mem_kb) / 1024:.0f}" if mem_kb != "0" else "0"
+        # Get memory in KB
+        mem_kb_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $6}}'"
+        mem_kb_process = await asyncio.create_subprocess_shell(
+            mem_kb_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        mem_kb_stdout, _ = await mem_kb_process.communicate()
+        mem_kb = mem_kb_stdout.decode().strip().split('\n')[0] or "0"
+        
+        try:
+            mem_mb = f"{int(float(mem_kb)) / 1024:.0f}"
+        except:
+            mem_mb = "0"
         
         # Get uptime
         uptime_cmd = f"systemctl status {MINECRAFT_SERVICE} --no-pager | grep 'Active:'"
@@ -7797,11 +7808,14 @@ async def mcperf(interaction: discord.Interaction):
         embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=True)
         
         # Add status indicator
-        if float(cpu_usage) > 80 or float(mem_percent) > 80:
-            embed.color = discord.Color.red()
-            embed.set_footer(text="⚠️ High resource usage detected")
-        else:
-            embed.set_footer(text="✅ Performance is normal")
+        try:
+            if float(cpu_usage) > 80 or float(mem_percent) > 80:
+                embed.color = discord.Color.red()
+                embed.set_footer(text="⚠️ High resource usage detected")
+            else:
+                embed.set_footer(text="✅ Performance is normal")
+        except:
+            embed.set_footer(text="Performance metrics")
         
         embed.timestamp = discord.utils.utcnow()
         

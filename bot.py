@@ -6852,6 +6852,629 @@ async def steamactivity(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
+# =========================================================
+# BOT SETUP & MANAGEMENT SYSTEM
+# =========================================================
+
+@bot.tree.command(name="botsetup", description="Configure bot settings and channels (Owner only)")
+async def botsetup(interaction: discord.Interaction):
+    """Comprehensive bot configuration menu"""
+    if interaction.user.id != int(os.getenv('BOT_OWNER_ID', 0)):
+        await interaction.response.send_message("❌ Only the bot owner can use this command!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    class SetupView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=300)
+        
+        @discord.ui.button(label="📢 Output Channel", style=discord.ButtonStyle.primary, row=0)
+        async def set_output(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.send_modal(ChannelModal("output", "Output Channel ID"))
+        
+        @discord.ui.button(label="📥 Input Channel", style=discord.ButtonStyle.primary, row=0)
+        async def set_input(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.send_modal(ChannelModal("input", "Input Channel ID"))
+        
+        @discord.ui.button(label="🎮 Steam Channel", style=discord.ButtonStyle.primary, row=0)
+        async def set_steam(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.send_modal(ChannelModal("steam", "Steam Activity Channel ID"))
+        
+        @discord.ui.button(label="📊 Status Channel", style=discord.ButtonStyle.primary, row=1)
+        async def set_status(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.send_modal(ChannelModal("status", "Status Channel ID"))
+        
+        @discord.ui.button(label="🔔 Monitoring Webhook", style=discord.ButtonStyle.primary, row=1)
+        async def set_webhook(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.send_modal(WebhookModal())
+        
+        @discord.ui.button(label="⚙️ Toggle Features", style=discord.ButtonStyle.secondary, row=2)
+        async def toggle_features(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            view = FeatureToggleView()
+            embed = create_feature_toggle_embed()
+            await btn_interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        
+        @discord.ui.button(label="📋 View Config", style=discord.ButtonStyle.secondary, row=2)
+        async def view_config(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            embed = await create_config_embed()
+            await btn_interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        @discord.ui.button(label="💾 Save to File", style=discord.ButtonStyle.success, row=2)
+        async def save_config(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await save_env_file()
+            await btn_interaction.response.send_message("✅ Configuration saved to .env file!", ephemeral=True)
+    
+    class ChannelModal(discord.ui.Modal):
+        def __init__(self, setting_type: str, title: str):
+            super().__init__(title=f"Set {title}")
+            self.setting_type = setting_type
+            
+            self.channel_id = discord.ui.TextInput(
+                label="Channel ID",
+                placeholder="Right-click channel → Copy ID",
+                required=True,
+                max_length=20
+            )
+            self.add_item(self.channel_id)
+        
+        async def on_submit(self, modal_interaction: discord.Interaction):
+            try:
+                channel_id = int(self.channel_id.value)
+                channel = bot.get_channel(channel_id)
+                
+                if not channel:
+                    await modal_interaction.response.send_message("❌ Channel not found!", ephemeral=True)
+                    return
+                
+                # Update the appropriate setting
+                if self.setting_type == "output":
+                    global OUTPUT_CHANNEL_ID
+                    OUTPUT_CHANNEL_ID = channel_id
+                elif self.setting_type == "input":
+                    global INPUT_CHANNEL_ID
+                    INPUT_CHANNEL_ID = channel_id
+                elif self.setting_type == "steam":
+                    bot.steam_activity_channel_id = channel_id
+                elif self.setting_type == "status":
+                    global STATUS_CHANNEL_ID
+                    STATUS_CHANNEL_ID = channel_id
+                
+                await modal_interaction.response.send_message(
+                    f"✅ {self.title} set to {channel.mention}",
+                    ephemeral=True
+                )
+            except ValueError:
+                await modal_interaction.response.send_message("❌ Invalid channel ID!", ephemeral=True)
+            except Exception as e:
+                await modal_interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+    
+    class WebhookModal(discord.ui.Modal, title="Set Monitoring Webhook"):
+        webhook_url = discord.ui.TextInput(
+            label="Webhook URL",
+            placeholder="https://discord.com/api/webhooks/...",
+            required=True,
+            style=discord.TextStyle.long
+        )
+        
+        async def on_submit(self, modal_interaction: discord.Interaction):
+            if not self.webhook_url.value.startswith("https://discord.com/api/webhooks/"):
+                await modal_interaction.response.send_message("❌ Invalid webhook URL!", ephemeral=True)
+                return
+            
+            os.environ['MONITORING_WEBHOOK_URL'] = self.webhook_url.value
+            await modal_interaction.response.send_message("✅ Monitoring webhook updated!", ephemeral=True)
+    
+    class FeatureToggleView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=180)
+        
+        @discord.ui.button(label="RSS Auto-Post", style=discord.ButtonStyle.secondary)
+        async def toggle_rss(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            current = os.getenv('ENABLE_RSS_AUTO', 'false').lower() == 'true'
+            new_value = 'false' if current else 'true'
+            os.environ['ENABLE_RSS_AUTO'] = new_value
+            
+            button.style = discord.ButtonStyle.success if new_value == 'true' else discord.ButtonStyle.secondary
+            button.label = f"RSS Auto-Post: {'ON' if new_value == 'true' else 'OFF'}"
+            
+            embed = create_feature_toggle_embed()
+            await btn_interaction.response.edit_message(embed=embed, view=self)
+    
+    def create_feature_toggle_embed():
+        embed = discord.Embed(
+            title="⚙️ Feature Toggles",
+            description="Enable or disable bot features",
+            color=discord.Color.blue()
+        )
+        
+        rss_status = "🟢 ON" if os.getenv('ENABLE_RSS_AUTO', 'false').lower() == 'true' else "🔴 OFF"
+        embed.add_field(name="RSS Auto-Post", value=rss_status, inline=True)
+        
+        return embed
+    
+    async def create_config_embed():
+        embed = discord.Embed(
+            title="📋 Current Bot Configuration",
+            description="Overview of all bot settings",
+            color=discord.Color.blurple()
+        )
+        
+        # Channel settings
+        output_ch = bot.get_channel(OUTPUT_CHANNEL_ID)
+        input_ch = bot.get_channel(INPUT_CHANNEL_ID)
+        status_ch = bot.get_channel(STATUS_CHANNEL_ID)
+        steam_ch = bot.get_channel(bot.steam_activity_channel_id) if bot.steam_activity_channel_id else None
+        
+        channels_text = f"**Output:** {output_ch.mention if output_ch else 'Not set'}\n"
+        channels_text += f"**Input:** {input_ch.mention if input_ch else 'Not set'}\n"
+        channels_text += f"**Status:** {status_ch.mention if status_ch else 'Not set'}\n"
+        channels_text += f"**Steam Activity:** {steam_ch.mention if steam_ch else 'Not set'}"
+        
+        embed.add_field(name="📢 Channels", value=channels_text, inline=False)
+        
+        # API Keys
+        api_text = f"**Steam API:** {'✅ Set' if os.getenv('STEAM_API_KEY') else '❌ Not set'}\n"
+        api_text += f"**Twitch Client ID:** {'✅ Set' if os.getenv('TWITCH_CLIENT_ID') else '❌ Not set'}\n"
+        api_text += f"**IGDB Access:** {'✅ Set' if os.getenv('TWITCH_CLIENT_SECRET') else '❌ Not set'}"
+        
+        embed.add_field(name="🔑 API Keys", value=api_text, inline=False)
+        
+        # Features
+        features_text = f"**RSS Auto-Post:** {'🟢 Enabled' if os.getenv('ENABLE_RSS_AUTO', 'false').lower() == 'true' else '🔴 Disabled'}\n"
+        features_text += f"**Steam OAuth Port:** {os.getenv('STEAM_OAUTH_PORT', 'Not set')}\n"
+        features_text += f"**Bot Owner:** <@{os.getenv('BOT_OWNER_ID', 'Not set')}>"
+        
+        embed.add_field(name="⚙️ Features", value=features_text, inline=False)
+        
+        # Stats
+        stats_text = f"**Guilds:** {len(bot.guilds)}\n"
+        stats_text += f"**Users:** {sum(g.member_count for g in bot.guilds)}\n"
+        stats_text += f"**Commands:** {len(bot.tree.get_commands())}"
+        
+        embed.add_field(name="📊 Stats", value=stats_text, inline=False)
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        return embed
+    
+    async def save_env_file():
+        """Save current configuration to .env file"""
+        env_content = f"""DISCORD_TOKEN={os.getenv('DISCORD_TOKEN', '')}
+TWITCH_CLIENT_ID={os.getenv('TWITCH_CLIENT_ID', '')}
+TWITCH_CLIENT_SECRET={os.getenv('TWITCH_CLIENT_SECRET', '')}
+STEAM_API_KEY={os.getenv('STEAM_API_KEY', '')}
+STEAM_OAUTH_PORT={os.getenv('STEAM_OAUTH_PORT', '5000')}
+STEAM_OAUTH_BASE_URL={os.getenv('STEAM_OAUTH_BASE_URL', '')}
+STEAM_OAUTH_CALLBACK_URL={os.getenv('STEAM_OAUTH_CALLBACK_URL', '')}
+ENABLE_RSS_AUTO={os.getenv('ENABLE_RSS_AUTO', 'false')}
+MONITORING_WEBHOOK_URL={os.getenv('MONITORING_WEBHOOK_URL', '')}
+BOT_OWNER_ID={os.getenv('BOT_OWNER_ID', '')}
+OUTPUT_CHANNEL_ID={OUTPUT_CHANNEL_ID}
+INPUT_CHANNEL_ID={INPUT_CHANNEL_ID}
+STATUS_CHANNEL_ID={STATUS_CHANNEL_ID}
+STEAM_ACTIVITY_CHANNEL_ID={bot.steam_activity_channel_id if bot.steam_activity_channel_id else ''}
+"""
+        
+        with open('.env', 'w') as f:
+            f.write(env_content)
+    
+    # Create main embed
+    embed = discord.Embed(
+        title="🛠️ Bot Setup & Configuration",
+        description="Configure all bot settings from Discord!\n\n"
+                    "Click the buttons below to manage different aspects of the bot.",
+        color=discord.Color.gold()
+    )
+    
+    embed.add_field(
+        name="📢 Channels",
+        value="Set output, input, status, and Steam activity channels",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚙️ Features",
+        value="Enable/disable bot features and automation",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💾 Configuration",
+        value="View current settings or save to file",
+        inline=False
+    )
+    
+    embed.set_footer(text="Only the bot owner can modify settings")
+    
+    view = SetupView()
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="botstats", description="View detailed bot statistics")
+async def botstats(interaction: discord.Interaction):
+    """Show bot statistics"""
+    await interaction.response.defer()
+    
+    try:
+        import psutil
+        import sys
+        
+        # System info
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+        cpu_percent = process.cpu_percent(interval=1)
+        
+        # Bot uptime
+        uptime = discord.utils.utcnow() - bot.start_time if hasattr(bot, 'start_time') else None
+        uptime_str = str(uptime).split('.')[0] if uptime else "Unknown"
+        
+        embed = discord.Embed(
+            title="📊 Bot Statistics",
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Bot info
+        bot_info = f"**Uptime:** {uptime_str}\n"
+        bot_info += f"**Guilds:** {len(bot.guilds)}\n"
+        bot_info += f"**Users:** {sum(g.member_count for g in bot.guilds)}\n"
+        bot_info += f"**Commands:** {len(bot.tree.get_commands())}"
+        embed.add_field(name="🤖 Bot Info", value=bot_info, inline=True)
+        
+        # System info
+        sys_info = f"**CPU Usage:** {cpu_percent}%\n"
+        sys_info += f"**Memory:** {memory_usage:.1f} MB\n"
+        sys_info += f"**Python:** {sys.version.split()[0]}\n"
+        sys_info += f"**Discord.py:** {discord.__version__}"
+        embed.add_field(name="💻 System", value=sys_info, inline=True)
+        
+        # Steam stats
+        steam_links = len(bot.steam_gaming_status) if hasattr(bot, 'steam_gaming_status') else 0
+        steam_info = f"**Linked Accounts:** {steam_links}\n"
+        steam_info += f"**Active Sessions:** {len(bot.steam_gaming_status)}\n"
+        steam_info += f"**Total Sessions:** {sum(len(s) for s in bot.steam_sessions.values()) if hasattr(bot, 'steam_sessions') else 0}"
+        embed.add_field(name="🎮 Steam", value=steam_info, inline=True)
+        
+        embed.set_footer(text=f"Bot ID: {bot.user.id}")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT BEDROCK SERVER MANAGEMENT
+# =========================================================
+
+MINECRAFT_SERVICE = "minecraft-bedrock"
+MINECRAFT_DIR = "/home/ubuntu/minecraft-bedrock"
+
+@bot.tree.command(name="mcstart", description="Start the Minecraft Bedrock server (Admin only)")
+async def mcstart(interaction: discord.Interaction):
+    """Start Minecraft server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Check if already running
+        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+        result = await asyncio.create_subprocess_shell(
+            check_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        status = stdout.decode().strip()
+        
+        if status == "active":
+            await interaction.followup.send("⚠️ Server is already running!")
+            return
+        
+        # Start server
+        start_cmd = f"systemctl start {MINECRAFT_SERVICE}"
+        process = await asyncio.create_subprocess_shell(
+            f"sudo {start_cmd}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="🟢 Minecraft Server Starting",
+            description="The Bedrock server is starting up...",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Server IP", value=f"`140.245.223.94:25565`", inline=False)
+        embed.set_footer(text="Wait 10-15 seconds before connecting")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcstop", description="Stop the Minecraft Bedrock server (Admin only)")
+async def mcstop(interaction: discord.Interaction):
+    """Stop Minecraft server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        stop_cmd = f"systemctl stop {MINECRAFT_SERVICE}"
+        process = await asyncio.create_subprocess_shell(
+            f"sudo {stop_cmd}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="🔴 Minecraft Server Stopped",
+            description="The Bedrock server has been shut down.",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="Use /mcstart to restart")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcrestart", description="Restart the Minecraft Bedrock server (Admin only)")
+async def mcrestart(interaction: discord.Interaction):
+    """Restart Minecraft server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        restart_cmd = f"systemctl restart {MINECRAFT_SERVICE}"
+        process = await asyncio.create_subprocess_shell(
+            f"sudo {restart_cmd}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="🔄 Minecraft Server Restarting",
+            description="The Bedrock server is restarting...",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Server IP", value=f"`140.245.223.94:25565`", inline=False)
+        embed.set_footer(text="Wait 10-15 seconds before reconnecting")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcstatus", description="Check Minecraft Bedrock server status")
+async def mcstatus(interaction: discord.Interaction):
+    """Check server status"""
+    await interaction.response.defer()
+    
+    try:
+        # Check service status
+        status_cmd = f"systemctl status {MINECRAFT_SERVICE}"
+        process = await asyncio.create_subprocess_shell(
+            status_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        output = stdout.decode()
+        
+        # Check if active
+        is_active = "active (running)" in output
+        
+        # Get uptime
+        uptime = "Unknown"
+        if is_active:
+            for line in output.split('\n'):
+                if 'Active:' in line:
+                    uptime = line.split('Active:')[1].strip().split(';')[0]
+                    break
+        
+        # Get memory usage
+        mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $6}}'"
+        mem_process = await asyncio.create_subprocess_shell(
+            mem_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        mem_stdout, _ = await mem_process.communicate()
+        memory_kb = mem_stdout.decode().strip()
+        memory_mb = f"{int(memory_kb) / 1024:.0f} MB" if memory_kb else "N/A"
+        
+        color = discord.Color.green() if is_active else discord.Color.red()
+        status_text = "🟢 Online" if is_active else "🔴 Offline"
+        
+        embed = discord.Embed(
+            title=f"Minecraft Bedrock Server Status",
+            color=color
+        )
+        embed.add_field(name="Status", value=status_text, inline=True)
+        embed.add_field(name="Server IP", value="`140.245.223.94:25565`", inline=True)
+        embed.add_field(name="Memory Usage", value=memory_mb, inline=True)
+        
+        if is_active:
+            embed.add_field(name="Uptime", value=uptime, inline=False)
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcupload", description="Upload resource pack or behavior pack to server (Admin only)")
+async def mcupload(interaction: discord.Interaction, pack_type: str, attachment: discord.Attachment):
+    """Upload packs to server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if pack_type not in ["resource", "behavior"]:
+            await interaction.followup.send("❌ pack_type must be 'resource' or 'behavior'")
+            return
+        
+        if not attachment.filename.endswith('.mcpack') and not attachment.filename.endswith('.zip'):
+            await interaction.followup.send("❌ File must be .mcpack or .zip format")
+            return
+        
+        # Download attachment
+        file_data = await attachment.read()
+        
+        # Determine target directory
+        if pack_type == "resource":
+            target_dir = f"{MINECRAFT_DIR}/resource_packs"
+        else:
+            target_dir = f"{MINECRAFT_DIR}/behavior_packs"
+        
+        # Create temp file and upload
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+            tmp.write(file_data)
+            tmp_path = tmp.name
+        
+        # This would need actual SCP/SFTP implementation
+        # For now, provide instructions
+        embed = discord.Embed(
+            title="📦 Pack Upload Instructions",
+            description=f"To install **{attachment.filename}**:",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Steps",
+            value=f"1. Download the pack from Discord\n"
+                  f"2. Upload to: `{target_dir}/`\n"
+                  f"3. Unzip if needed\n"
+                  f"4. Run `/mcrestart`",
+            inline=False
+        )
+        embed.set_footer(text="Automatic upload coming soon!")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcbackup", description="Backup the Minecraft world (Admin only)")
+async def mcbackup(interaction: discord.Interaction):
+    """Backup world"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        timestamp = discord.utils.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"mc_world_backup_{timestamp}.tar.gz"
+        
+        backup_cmd = f"cd {MINECRAFT_DIR} && tar -czf ~/minecraft-backups/{backup_name} worlds/"
+        
+        # Create backup directory
+        mkdir_cmd = "mkdir -p ~/minecraft-backups"
+        await asyncio.create_subprocess_shell(mkdir_cmd)
+        
+        # Run backup
+        process = await asyncio.create_subprocess_shell(
+            backup_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        # Get backup size
+        size_cmd = f"du -h ~/minecraft-backups/{backup_name} | cut -f1"
+        size_process = await asyncio.create_subprocess_shell(
+            size_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        size_stdout, _ = await size_process.communicate()
+        size = size_stdout.decode().strip()
+        
+        embed = discord.Embed(
+            title="💾 World Backup Created",
+            description=f"Backup saved successfully!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Filename", value=backup_name, inline=False)
+        embed.add_field(name="Size", value=size, inline=True)
+        embed.add_field(name="Location", value="`~/minecraft-backups/`", inline=True)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcwhitelist", description="Manage server whitelist (Admin only)")
+async def mcwhitelist(interaction: discord.Interaction, action: str, username: str = None):
+    """Manage whitelist"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if action == "list":
+            # Read whitelist
+            read_cmd = f"cat {MINECRAFT_DIR}/whitelist.json"
+            process = await asyncio.create_subprocess_shell(
+                read_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+            
+            embed = discord.Embed(
+                title="📋 Whitelist",
+                description="Current whitelisted players:",
+                color=discord.Color.blue()
+            )
+            
+            try:
+                import json
+                whitelist = json.loads(stdout.decode())
+                if whitelist:
+                    players = "\n".join([f"• {p.get('name', 'Unknown')}" for p in whitelist])
+                    embed.add_field(name="Players", value=players, inline=False)
+                else:
+                    embed.description = "Whitelist is empty"
+            except:
+                embed.description = "Could not read whitelist"
+            
+            await interaction.followup.send(embed=embed)
+        
+        elif action in ["add", "remove"] and username:
+            # Note: Bedrock uses Xbox gamertags
+            await interaction.followup.send(
+                f"ℹ️ To {action} **{username}** to whitelist:\n"
+                f"1. Connect to server console\n"
+                f"2. Run: `whitelist {action} {username}`\n"
+                f"3. Or edit `{MINECRAFT_DIR}/whitelist.json` manually"
+            )
+        else:
+            await interaction.followup.send("❌ Usage: `/mcwhitelist list` or `/mcwhitelist add/remove username`")
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
 # -------------------------
 # LOAD MONITORING COG
 # -------------------------

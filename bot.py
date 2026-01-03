@@ -7103,6 +7103,11 @@ async def botstats(interaction: discord.Interaction):
         process = psutil.Process()
         memory_usage = process.memory_info().rss / 1024 / 1024  # MB
         cpu_percent = process.cpu_percent(interval=1)
+        # System-wide memory
+        sys_mem = psutil.virtual_memory()
+        sys_mem_used = sys_mem.used / 1024 / 1024  # MB
+        sys_mem_total = sys_mem.total / 1024 / 1024  # MB
+        sys_mem_percent = sys_mem.percent
         
         # Bot uptime
         uptime = discord.utils.utcnow() - bot.start_time if hasattr(bot, 'start_time') else None
@@ -7122,8 +7127,9 @@ async def botstats(interaction: discord.Interaction):
         embed.add_field(name="🤖 Bot Info", value=bot_info, inline=True)
         
         # System info
-        sys_info = f"**CPU Usage:** {cpu_percent}%\n"
-        sys_info += f"**Memory:** {memory_usage:.1f} MB\n"
+        sys_info = f"**Bot CPU Usage:** {cpu_percent}%\n"
+        sys_info += f"**Bot Memory:** {memory_usage:.1f} MB\n"
+        sys_info += f"**System Memory:** {sys_mem_used:.1f} MB / {sys_mem_total:.1f} MB ({sys_mem_percent}%)\n"
         sys_info += f"**Python:** {sys.version.split()[0]}\n"
         sys_info += f"**Discord.py:** {discord.__version__}"
         embed.add_field(name="💻 System", value=sys_info, inline=True)

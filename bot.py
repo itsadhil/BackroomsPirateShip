@@ -7499,21 +7499,47 @@ async def mccommand(interaction: discord.Interaction, command: str):
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send command via screen or RCON (Bedrock doesn't have built-in RCON)
-        # For now, use systemd-run with stdin pipe
-        exec_cmd = f"echo '{command}' | systemctl status {MINECRAFT_SERVICE} --no-pager"
+        # Send command via screen session (requires server running in screen)
+        # Screen session name should be "minecraft" 
+        screen_cmd = f"screen -S minecraft -p 0 -X stuff '{command}\\n'"
+        process = await asyncio.create_subprocess_shell(
+            screen_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        # Check if screen session exists
+        if b"No screen session found" in stderr or process.returncode != 0:
+            embed = discord.Embed(
+                title="⚠️ Console Not Available",
+                description="Server is not running in a screen session.",
+                color=discord.Color.orange()
+            )
+            embed.add_field(
+                name="Setup Instructions",
+                value="Run this on the server:\n"
+                      "```bash\n"
+                      "sudo systemctl stop minecraft-bedrock\n"
+                      "screen -S minecraft -dm bash -c 'cd /home/ubuntu/minecraft-bedrock && LD_LIBRARY_PATH=. ./bedrock_server'\n"
+                      "```\n"
+                      "Then use `/mclogs` to view command results.",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
+            return
         
         embed = discord.Embed(
-            title="📝 Console Command",
-            description=f"Command: `{command}`",
-            color=discord.Color.blue()
+            title="✅ Command Executed",
+            description=f"```\n{command}\n```",
+            color=discord.Color.green()
         )
         embed.add_field(
-            name="Note",
-            value="Bedrock server console access requires additional setup.\nUse `/mclogs` to view recent logs.",
+            name="Check Results",
+            value="Use `/mclogs` to see command output",
             inline=False
         )
-        embed.set_footer(text="RCON support coming soon!")
+        embed.set_footer(text="Command sent to server console")
         
         await interaction.followup.send(embed=embed)
         

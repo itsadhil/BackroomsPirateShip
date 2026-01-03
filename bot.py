@@ -7187,27 +7187,21 @@ async def mcstart(interaction: discord.Interaction):
     
     try:
         # Check if already running
-        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
-        result = await asyncio.create_subprocess_shell(
-            check_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await result.communicate()
-        status = stdout.decode().strip()
-        
-        if status == "active":
+        if await is_minecraft_running():
             await interaction.followup.send("⚠️ Server is already running!")
             return
         
-        # Start server
-        start_cmd = f"systemctl start {MINECRAFT_SERVICE}"
+        # Start server in screen session
+        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
         process = await asyncio.create_subprocess_shell(
-            f"sudo {start_cmd}",
+            start_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
+        
+        # Wait a moment for startup
+        await asyncio.sleep(2)
         
         embed = discord.Embed(
             title="🟢 Minecraft Server Starting",
@@ -7215,6 +7209,7 @@ async def mcstart(interaction: discord.Interaction):
             color=discord.Color.green()
         )
         embed.add_field(name="Server IP", value=f"`140.245.223.94:19132`", inline=False)
+        embed.add_field(name="Console", value="Use `/mcconsole start` to view live logs", inline=False)
         embed.set_footer(text="Wait 10-15 seconds before connecting")
         
         await interaction.followup.send(embed=embed)
@@ -7232,9 +7227,27 @@ async def mcstop(interaction: discord.Interaction):
     await interaction.response.defer()
     
     try:
-        stop_cmd = f"systemctl stop {MINECRAFT_SERVICE}"
+        # Check if running
+        if not await is_minecraft_running():
+            await interaction.followup.send("⚠️ Server is not running!")
+            return
+        
+        # Send stop command to server first (graceful shutdown)
+        stop_server_cmd = "screen -S minecraft -X stuff 'stop\n'"
         process = await asyncio.create_subprocess_shell(
-            f"sudo {stop_cmd}",
+            stop_server_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        # Wait for graceful shutdown
+        await asyncio.sleep(5)
+        
+        # Force kill screen if still running
+        kill_cmd = "screen -X -S minecraft quit"
+        process = await asyncio.create_subprocess_shell(
+            kill_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -7262,13 +7275,34 @@ async def mcrestart(interaction: discord.Interaction):
     await interaction.response.defer()
     
     try:
-        restart_cmd = f"systemctl restart {MINECRAFT_SERVICE}"
+        was_running = await is_minecraft_running()
+        
+        if was_running:
+            # Send stop command
+            stop_cmd = "screen -S minecraft -X stuff 'stop\n'"
+            process = await asyncio.create_subprocess_shell(
+                stop_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            await asyncio.sleep(5)
+            
+            # Force kill if needed
+            kill_cmd = "screen -X -S minecraft quit"
+            await asyncio.create_subprocess_shell(kill_cmd)
+            await asyncio.sleep(1)
+        
+        # Start fresh
+        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
         process = await asyncio.create_subprocess_shell(
-            f"sudo {restart_cmd}",
+            start_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
+        
+        await asyncio.sleep(2)
         
         embed = discord.Embed(
             title="🔄 Minecraft Server Restarting",
@@ -7276,6 +7310,7 @@ async def mcrestart(interaction: discord.Interaction):
             color=discord.Color.orange()
         )
         embed.add_field(name="Server IP", value=f"`140.245.223.94:19132`", inline=False)
+        embed.add_field(name="Console", value="Use `/mcconsole start` to view live logs", inline=False)
         embed.set_footer(text="Wait 10-15 seconds before reconnecting")
         
         await interaction.followup.send(embed=embed)

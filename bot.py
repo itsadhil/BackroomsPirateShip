@@ -8021,7 +8021,9 @@ async def mcconsole(interaction: discord.Interaction, action: str):
         if action.lower() == "start":
             bot.mc_console_channel = interaction.channel.id
             bot.mc_console_enabled = True
-            bot.mc_log_position = 0  # Reset position
+            bot.mc_last_timestamp = discord.utils.utcnow()  # Reset timestamp
+            if hasattr(bot, 'mc_processed_lines'):
+                bot.mc_processed_lines.clear()  # Clear processed lines
             
             embed = discord.Embed(
                 title="🖥️ Live Console Started",
@@ -8077,27 +8079,53 @@ async def minecraft_console_stream():
         if not channel:
             return
         
-        # Initialize last position tracker
-        if not hasattr(bot, 'mc_log_position'):
-            bot.mc_log_position = 0
+        # Initialize last timestamp tracker for screen logs
+        if not hasattr(bot, 'mc_last_timestamp'):
+            bot.mc_last_timestamp = discord.utils.utcnow()
         
-        # Get new log entries since last check
-        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --no-pager --lines=1000 -o cat"
+        # Get logs from screen session
+        # Dump screen buffer to temp file
+        screen_log = "/tmp/mc_console_stream.log"
+        dump_cmd = f"screen -S minecraft -X hardcopy -h {screen_log} && tail -n 50 {screen_log}"
         process = await asyncio.create_subprocess_shell(
-            logs_cmd,
+            dump_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await process.communicate()
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            # Fallback to journalctl if screen fails
+            logs_cmd = f"journalctl --since '{bot.mc_last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}' --no-pager -n 100 -o cat | grep -E 'bedrock_server|minecraft'"
+            process = await asyncio.create_subprocess_shell(
+                logs_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+        
         all_logs = stdout.decode()
         
-        # Split into lines
-        lines = all_logs.split('\n')
+        # Update last check time
+        bot.mc_last_timestamp = discord.utils.utcnow()
         
-        # Only process new lines
-        if bot.mc_log_position < len(lines):
-            new_lines = lines[bot.mc_log_position:]
-            bot.mc_log_position = len(lines)
+        # Split into lines
+        lines = all_logs.strip().split('\n')
+        
+        # Track processed lines to avoid duplicates
+        if not hasattr(bot, 'mc_processed_lines'):
+            bot.mc_processed_lines = set()
+        
+        new_lines = []
+        for line in lines:
+            line_hash = hash(line)
+            if line_hash not in bot.mc_processed_lines:
+                bot.mc_processed_lines.add(line_hash)
+                new_lines.append(line)
+        
+        # Keep only recent hashes to avoid memory bloat
+        if len(bot.mc_processed_lines) > 500:
+            bot.mc_processed_lines.clear()
             
             for line in new_lines:
                 line = line.strip()

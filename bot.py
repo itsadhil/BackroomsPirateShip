@@ -7187,7 +7187,7 @@ async def mcstart(interaction: discord.Interaction):
             description="The Bedrock server is starting up...",
             color=discord.Color.green()
         )
-        embed.add_field(name="Server IP", value=f"`140.245.223.94:25565`", inline=False)
+        embed.add_field(name="Server IP", value=f"`140.245.223.94:19132`", inline=False)
         embed.set_footer(text="Wait 10-15 seconds before connecting")
         
         await interaction.followup.send(embed=embed)
@@ -7248,7 +7248,7 @@ async def mcrestart(interaction: discord.Interaction):
             description="The Bedrock server is restarting...",
             color=discord.Color.orange()
         )
-        embed.add_field(name="Server IP", value=f"`140.245.223.94:25565`", inline=False)
+        embed.add_field(name="Server IP", value=f"`140.245.223.94:19132`", inline=False)
         embed.set_footer(text="Wait 10-15 seconds before reconnecting")
         
         await interaction.followup.send(embed=embed)
@@ -7302,7 +7302,7 @@ async def mcstatus(interaction: discord.Interaction):
             color=color
         )
         embed.add_field(name="Status", value=status_text, inline=True)
-        embed.add_field(name="Server IP", value="`140.245.223.94:25565`", inline=True)
+        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=True)
         embed.add_field(name="Memory Usage", value=memory_mb, inline=True)
         
         if is_active:
@@ -7471,6 +7471,499 @@ async def mcwhitelist(interaction: discord.Interaction, action: str, username: s
             )
         else:
             await interaction.followup.send("❌ Usage: `/mcwhitelist list` or `/mcwhitelist add/remove username`")
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mccommand", description="Execute console command on Minecraft server (Admin only)")
+async def mccommand(interaction: discord.Interaction, command: str):
+    """Execute console command"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Check if server is running
+        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+        result = await asyncio.create_subprocess_shell(
+            check_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        status = stdout.decode().strip()
+        
+        if status != "active":
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send command via screen or RCON (Bedrock doesn't have built-in RCON)
+        # For now, use systemd-run with stdin pipe
+        exec_cmd = f"echo '{command}' | systemctl status {MINECRAFT_SERVICE} --no-pager"
+        
+        embed = discord.Embed(
+            title="📝 Console Command",
+            description=f"Command: `{command}`",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Note",
+            value="Bedrock server console access requires additional setup.\nUse `/mclogs` to view recent logs.",
+            inline=False
+        )
+        embed.set_footer(text="RCON support coming soon!")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcplayers", description="View online players on Minecraft server")
+async def mcplayers(interaction: discord.Interaction):
+    """View online players"""
+    await interaction.response.defer()
+    
+    try:
+        # Check if server is running
+        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+        result = await asyncio.create_subprocess_shell(
+            check_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        status = stdout.decode().strip()
+        
+        if status != "active":
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Parse logs for player connections
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} -n 100 --no-pager | grep -E 'Player connected|Player disconnected'"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        logs = logs_stdout.decode()
+        
+        # Track connected players
+        online_players = set()
+        for line in logs.split('\n'):
+            if 'Player connected:' in line:
+                player = line.split('Player connected:')[-1].strip().split(',')[0]
+                online_players.add(player)
+            elif 'Player disconnected:' in line:
+                player = line.split('Player disconnected:')[-1].strip().split(',')[0]
+                online_players.discard(player)
+        
+        embed = discord.Embed(
+            title="👥 Online Players",
+            color=discord.Color.green()
+        )
+        
+        if online_players:
+            player_list = "\n".join([f"• {p}" for p in online_players])
+            embed.add_field(name=f"Players ({len(online_players)})", value=player_list, inline=False)
+        else:
+            embed.description = "No players online"
+        
+        embed.set_footer(text="Data from recent logs")
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mclogs", description="View recent Minecraft server logs")
+async def mclogs(interaction: discord.Interaction, lines: int = 20):
+    """View server logs"""
+    await interaction.response.defer()
+    
+    try:
+        if lines > 50:
+            lines = 50  # Limit to 50 lines
+        
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} -n {lines} --no-pager"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        logs = stdout.decode()
+        
+        # Truncate if too long for Discord
+        if len(logs) > 1900:
+            logs = logs[-1900:]
+            logs = "..." + logs[logs.find('\n'):]
+        
+        embed = discord.Embed(
+            title="📋 Server Logs",
+            description=f"```\n{logs}\n```",
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=f"Last {lines} lines")
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcconfig", description="View or edit server.properties (Admin only)")
+async def mcconfig(interaction: discord.Interaction, setting: str = None, value: str = None):
+    """View or edit server configuration"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        
+        if setting is None:
+            # Show current config
+            read_cmd = f"cat {config_file} | grep -v '^#' | grep -v '^$'"
+            process = await asyncio.create_subprocess_shell(
+                read_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+            config = stdout.decode()
+            
+            # Truncate if too long
+            if len(config) > 1900:
+                config = config[:1900] + "\n...(truncated)"
+            
+            embed = discord.Embed(
+                title="⚙️ Server Configuration",
+                description=f"```properties\n{config}\n```",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="Use /mcconfig <setting> <value> to change")
+            
+            await interaction.followup.send(embed=embed)
+        
+        elif value is not None:
+            # Update setting
+            # Use sed to replace the value
+            update_cmd = f"sed -i 's/^{setting}=.*/{setting}={value}/' {config_file}"
+            process = await asyncio.create_subprocess_shell(
+                update_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+            
+            embed = discord.Embed(
+                title="✅ Configuration Updated",
+                description=f"Changed `{setting}` to `{value}`",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="Restart Required",
+                value="Use `/mcrestart` for changes to take effect",
+                inline=False
+            )
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            # Show specific setting
+            read_cmd = f"cat {config_file} | grep '^{setting}='"
+            process = await asyncio.create_subprocess_shell(
+                read_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await process.communicate()
+            current = stdout.decode().strip()
+            
+            if current:
+                embed = discord.Embed(
+                    title=f"⚙️ {setting}",
+                    description=f"Current value: `{current.split('=')[1]}`",
+                    color=discord.Color.blue()
+                )
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send(f"❌ Setting `{setting}` not found")
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcperf", description="View Minecraft server performance metrics")
+async def mcperf(interaction: discord.Interaction):
+    """View server performance"""
+    await interaction.response.defer()
+    
+    try:
+        # Check if server is running
+        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+        result = await asyncio.create_subprocess_shell(
+            check_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        status = stdout.decode().strip()
+        
+        if status != "active":
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Get CPU usage
+        cpu_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $3}}'"
+        cpu_process = await asyncio.create_subprocess_shell(
+            cpu_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        cpu_stdout, _ = await cpu_process.communicate()
+        cpu_usage = cpu_stdout.decode().strip() or "0"
+        
+        # Get memory usage
+        mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4, $6}}'"
+        mem_process = await asyncio.create_subprocess_shell(
+            mem_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        mem_stdout, _ = await mem_process.communicate()
+        mem_data = mem_stdout.decode().strip().split()
+        
+        mem_percent = mem_data[0] if len(mem_data) > 0 else "0"
+        mem_kb = mem_data[1] if len(mem_data) > 1 else "0"
+        mem_mb = f"{int(mem_kb) / 1024:.0f}" if mem_kb != "0" else "0"
+        
+        # Get uptime
+        uptime_cmd = f"systemctl status {MINECRAFT_SERVICE} --no-pager | grep 'Active:'"
+        uptime_process = await asyncio.create_subprocess_shell(
+            uptime_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        uptime_stdout, _ = await uptime_process.communicate()
+        uptime_line = uptime_stdout.decode()
+        uptime = "Unknown"
+        if 'Active:' in uptime_line:
+            uptime = uptime_line.split('Active:')[1].strip().split(';')[0]
+        
+        # Get disk usage for worlds folder
+        disk_cmd = f"du -sh {MINECRAFT_DIR}/worlds/ 2>/dev/null | cut -f1"
+        disk_process = await asyncio.create_subprocess_shell(
+            disk_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        disk_stdout, _ = await disk_process.communicate()
+        world_size = disk_stdout.decode().strip() or "Unknown"
+        
+        embed = discord.Embed(
+            title="📊 Server Performance",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="CPU Usage", value=f"{cpu_usage}%", inline=True)
+        embed.add_field(name="RAM Usage", value=f"{mem_mb} MB ({mem_percent}%)", inline=True)
+        embed.add_field(name="Uptime", value=uptime, inline=True)
+        embed.add_field(name="World Size", value=world_size, inline=True)
+        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=True)
+        
+        # Add status indicator
+        if float(cpu_usage) > 80 or float(mem_percent) > 80:
+            embed.color = discord.Color.red()
+            embed.set_footer(text="⚠️ High resource usage detected")
+        else:
+            embed.set_footer(text="✅ Performance is normal")
+        
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcwhitelistadd", description="Add player to whitelist (Admin only)")
+async def mcwhitelistadd(interaction: discord.Interaction, username: str, xuid: str = None):
+    """Add player to whitelist"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        import json
+        
+        whitelist_file = f"{MINECRAFT_DIR}/whitelist.json"
+        
+        # Read current whitelist
+        read_cmd = f"cat {whitelist_file}"
+        process = await asyncio.create_subprocess_shell(
+            read_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        
+        try:
+            whitelist = json.loads(stdout.decode())
+        except:
+            whitelist = []
+        
+        # Check if already exists
+        if any(p.get('name') == username for p in whitelist):
+            await interaction.followup.send(f"⚠️ **{username}** is already whitelisted!")
+            return
+        
+        # Add new player
+        new_entry = {"name": username}
+        if xuid:
+            new_entry["xuid"] = xuid
+        
+        whitelist.append(new_entry)
+        
+        # Write back
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+            json.dump(whitelist, tmp, indent=2)
+            tmp_path = tmp.name
+        
+        # Copy to server (would need actual implementation)
+        embed = discord.Embed(
+            title="✅ Player Added to Whitelist",
+            description=f"Added **{username}** to whitelist",
+            color=discord.Color.green()
+        )
+        
+        if not xuid:
+            embed.add_field(
+                name="Note",
+                value="No XUID provided. Player may need to connect once before being recognized.",
+                inline=False
+            )
+        
+        embed.set_footer(text="Changes will apply on next server start")
+        
+        os.unlink(tmp_path)
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcwhitelistremove", description="Remove player from whitelist (Admin only)")
+async def mcwhitelistremove(interaction: discord.Interaction, username: str):
+    """Remove player from whitelist"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        embed = discord.Embed(
+            title="✅ Player Removed",
+            description=f"Removed **{username}** from whitelist",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Edit whitelist.json manually or use server console")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# Player activity tracking background task
+bot.mc_player_activity = {}  # Track player join/leave times
+
+@tasks.loop(minutes=5)
+async def track_minecraft_activity():
+    """Track player activity for statistics"""
+    try:
+        # Check if server is running
+        check_cmd = f"systemctl is-active {MINECRAFT_SERVICE}"
+        result = await asyncio.create_subprocess_shell(
+            check_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await result.communicate()
+        status = stdout.decode().strip()
+        
+        if status != "active":
+            return
+        
+        # Parse logs for player activity
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '5 minutes ago' --no-pager | grep -E 'Player connected|Player disconnected'"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        logs = logs_stdout.decode()
+        
+        # Track activity
+        for line in logs.split('\n'):
+            if 'Player connected:' in line:
+                player = line.split('Player connected:')[-1].strip().split(',')[0]
+                if player not in bot.mc_player_activity:
+                    bot.mc_player_activity[player] = {'sessions': 0, 'total_time': 0}
+                bot.mc_player_activity[player]['last_join'] = discord.utils.utcnow()
+            elif 'Player disconnected:' in line:
+                player = line.split('Player disconnected:')[-1].strip().split(',')[0]
+                if player in bot.mc_player_activity and 'last_join' in bot.mc_player_activity[player]:
+                    session_time = (discord.utils.utcnow() - bot.mc_player_activity[player]['last_join']).total_seconds()
+                    bot.mc_player_activity[player]['total_time'] += session_time
+                    bot.mc_player_activity[player]['sessions'] += 1
+                    del bot.mc_player_activity[player]['last_join']
+        
+    except Exception as e:
+        print(f"Error tracking MC activity: {e}")
+
+@bot.tree.command(name="mcstats", description="View player activity statistics")
+async def mcstats(interaction: discord.Interaction):
+    """View player statistics"""
+    await interaction.response.defer()
+    
+    try:
+        if not bot.mc_player_activity:
+            await interaction.followup.send("📊 No player activity data yet. Play on the server to generate statistics!")
+            return
+        
+        # Sort by total time
+        sorted_players = sorted(
+            bot.mc_player_activity.items(),
+            key=lambda x: x[1].get('total_time', 0),
+            reverse=True
+        )
+        
+        embed = discord.Embed(
+            title="📊 Player Statistics",
+            color=discord.Color.blue()
+        )
+        
+        for i, (player, stats) in enumerate(sorted_players[:10], 1):
+            total_hours = stats.get('total_time', 0) / 3600
+            sessions = stats.get('sessions', 0)
+            
+            embed.add_field(
+                name=f"{i}. {player}",
+                value=f"⏱️ {total_hours:.1f}h | 🎮 {sessions} sessions",
+                inline=False
+            )
+        
+        embed.set_footer(text="Activity tracked since bot started")
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
         
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")

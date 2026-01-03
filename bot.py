@@ -8004,16 +8004,19 @@ async def track_minecraft_activity():
         print(f"Error tracking MC activity: {e}")
 
 @bot.tree.command(name="mcstats", description="View player activity statistics")
-async def mcstats(interaction: discord.Interaction):
-    """View player statistics"""
+async def botstats(interaction: discord.Interaction):
+    """Show bot statistics"""
+    import psutil
+    import sys
+    process = psutil.Process()
+    # Prime the CPU percent calculation
+    process.cpu_percent(interval=None)
     await interaction.response.defer()
-    
     try:
-        if not bot.mc_player_activity:
-            await interaction.followup.send("📊 No player activity data yet. Play on the server to generate statistics!")
-            return
-        
-        # Sort by total time
+        import asyncio
+        await asyncio.sleep(1)
+        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+        cpu_percent = process.cpu_percent(interval=None)
         sorted_players = sorted(
             bot.mc_player_activity.items(),
             key=lambda x: x[1].get('total_time', 0),

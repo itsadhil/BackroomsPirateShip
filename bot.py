@@ -8021,15 +8021,21 @@ async def mcconsole(interaction: discord.Interaction, action: str):
         if action.lower() == "start":
             bot.mc_console_channel = interaction.channel.id
             bot.mc_console_enabled = True
+            bot.mc_log_position = 0  # Reset position
             
             embed = discord.Embed(
                 title="🖥️ Live Console Started",
-                description=f"Server logs will stream to {interaction.channel.mention}",
+                description=f"Full server console will stream to {interaction.channel.mention}",
                 color=discord.Color.green()
             )
             embed.add_field(
                 name="Features",
-                value="• Real-time log streaming\n• Player join/leave notifications\n• Command execution logs\n• Server events",
+                value="• **All** server logs in real-time\n• Player join/leave (colored)\n• Errors/warnings (highlighted)\n• Server events\n• Every console message",
+                inline=False
+            )
+            embed.add_field(
+                name="Note",
+                value="This will send MANY messages. Use a dedicated channel!",
                 inline=False
             )
             embed.set_footer(text="Use /mcconsole stop to disable")
@@ -8057,7 +8063,7 @@ async def mcconsole(interaction: discord.Interaction, action: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=2)
 async def minecraft_console_stream():
     """Stream Minecraft console logs to Discord"""
     try:
@@ -8071,77 +8077,76 @@ async def minecraft_console_stream():
         if not channel:
             return
         
-        # Get recent logs
-        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} -n 5 --no-pager --since '10 seconds ago' 2>/dev/null || screen -S minecraft -X hardcopy /tmp/mc_screen.log && tail -n 5 /tmp/mc_screen.log"
+        # Initialize last position tracker
+        if not hasattr(bot, 'mc_log_position'):
+            bot.mc_log_position = 0
+        
+        # Get new log entries since last check
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --no-pager --lines=1000 -o cat"
         process = await asyncio.create_subprocess_shell(
             logs_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await process.communicate()
-        logs = stdout.decode().strip()
+        all_logs = stdout.decode()
         
-        if not logs or logs == bot.mc_last_log_line:
-            return
+        # Split into lines
+        lines = all_logs.split('\n')
         
-        bot.mc_last_log_line = logs
-        
-        # Parse logs for important events
-        lines = logs.split('\n')
-        for line in lines:
-            if not line.strip():
-                continue
+        # Only process new lines
+        if bot.mc_log_position < len(lines):
+            new_lines = lines[bot.mc_log_position:]
+            bot.mc_log_position = len(lines)
             
-            # Extract timestamp and message
-            if 'INFO]' in line:
-                msg = line.split('INFO]')[-1].strip()
-            else:
+            for line in new_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Skip systemd metadata
+                if line.startswith('[') and ']' in line[:30]:
+                    line = line.split(']', 1)[-1].strip()
+                
+                # Extract message
                 msg = line
-            
-            # Skip duplicate messages
-            if hasattr(bot, 'mc_last_messages') and msg in bot.mc_last_messages:
-                continue
-            
-            if not hasattr(bot, 'mc_last_messages'):
-                bot.mc_last_messages = []
-            
-            bot.mc_last_messages.append(msg)
-            if len(bot.mc_last_messages) > 50:
-                bot.mc_last_messages.pop(0)
-            
-            # Color code based on event type
-            color = None
-            emoji = "📋"
-            
-            if "Player connected:" in msg or "Player Spawned:" in msg:
-                color = discord.Color.green()
-                emoji = "✅"
-            elif "Player disconnected:" in msg:
-                color = discord.Color.red()
-                emoji = "❌"
-            elif "ERROR" in line.upper() or "WARN" in line.upper():
-                color = discord.Color.orange()
-                emoji = "⚠️"
-            elif "Server started" in msg:
-                color = discord.Color.blue()
-                emoji = "🟢"
-            elif "Stopping server" in msg or "Server stop" in msg:
-                color = discord.Color.red()
-                emoji = "🔴"
-            
-            # Create compact embed for important events
-            if color:
-                embed = discord.Embed(
-                    description=f"{emoji} {msg[:200]}",
-                    color=color,
-                    timestamp=discord.utils.utcnow()
-                )
-                await channel.send(embed=embed)
-            else:
-                # Regular log message in code block
-                if len(msg) > 150:
-                    msg = msg[:150] + "..."
-                await channel.send(f"```{msg}```")
+                if 'INFO]' in line:
+                    msg = line.split('INFO]')[-1].strip()
+                elif 'WARN]' in line:
+                    msg = line.split('WARN]')[-1].strip()
+                elif 'ERROR]' in line:
+                    msg = line.split('ERROR]')[-1].strip()
+                
+                if not msg or len(msg) < 3:
+                    continue
+                
+                # Detect event type and format
+                if "Player connected:" in msg or "Player Spawned:" in msg:
+                    embed = discord.Embed(description=f"✅ {msg[:200]}", color=discord.Color.green())
+                    await channel.send(embed=embed)
+                elif "Player disconnected:" in msg:
+                    embed = discord.Embed(description=f"❌ {msg[:200]}", color=discord.Color.red())
+                    await channel.send(embed=embed)
+                elif "ERROR" in line.upper():
+                    embed = discord.Embed(description=f"🔴 {msg[:200]}", color=discord.Color.red())
+                    await channel.send(embed=embed)
+                elif "WARN" in line.upper():
+                    embed = discord.Embed(description=f"⚠️ {msg[:200]}", color=discord.Color.orange())
+                    await channel.send(embed=embed)
+                elif "Server started" in msg or "IPv4 supported" in msg:
+                    embed = discord.Embed(description=f"🟢 {msg[:200]}", color=discord.Color.green())
+                    await channel.send(embed=embed)
+                elif "Stopping server" in msg or "Server stop" in msg:
+                    embed = discord.Embed(description=f"🔴 {msg[:200]}", color=discord.Color.red())
+                    await channel.send(embed=embed)
+                else:
+                    # Show all other console output
+                    if len(msg) > 100:
+                        msg = msg[:100] + "..."
+                    await channel.send(f"`{msg}`")
+                
+                # Rate limit: small delay between messages
+                await asyncio.sleep(0.1)
     
     except Exception as e:
         print(f"Error in console stream: {e}")

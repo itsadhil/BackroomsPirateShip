@@ -82,6 +82,7 @@ async def handle_github_webhook(request):
     return web.Response(text="OK")
 
 def setup_github_webhook_server():
+    print("setup_github_webhook_server() called")  # <--- Add this line
     app = web.Application()
     app.router.add_post('/github', handle_github_webhook)
     runner = web.AppRunner(app)
@@ -93,11 +94,7 @@ def setup_github_webhook_server():
         print("GitHub webhook server running on port 8080")
     loop.create_task(start())
 
-# Call this after bot is ready
-@bot.event
-async def on_ready():
-    setup_github_webhook_server()
-    print(f"Bot is ready. Logged in as {bot.user}")
+## Remove duplicate on_ready and merge logic below
 bot.collections = {}  # Track user collections (user_id: {collection_name: [thread_ids]})
 bot.bookmarks = {}  # Track user bookmarks (user_id: [thread_ids])
 bot.compatibility_reports = {}  # Track compatibility reports (thread_id: [{user_id, status, specs, notes}])
@@ -1165,23 +1162,26 @@ async def on_ready():
     load_webhooks_data()
     load_collections_data()
     load_compatibility_data()
-    
+
+    # Start GitHub webhook server
+    setup_github_webhook_server()
+
     # Start Steam OAuth server
     from steam_oauth_server import start_oauth_server
     oauth_port = int(os.getenv('STEAM_OAUTH_PORT', '5000'))
     start_oauth_server(port=oauth_port)
     print(f"✅ Steam OAuth server started on port {oauth_port}")
-    
+
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
-    
+
     # Copy global commands to the guild for fast development
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
     print(f"✅ Logged in as {bot.user}")
     print(f"✅ Commands synced to guild ID: {GUILD_ID}")
-    
+
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
     if rss_enabled and not fitgirl_rss_monitor.is_running():
@@ -1189,32 +1189,32 @@ async def on_ready():
         print(f"✅ FitGirl RSS Monitor started (checking every 30 minutes)")
     else:
         print(f"⚠️ RSS Auto-posting disabled (set ENABLE_RSS_AUTO=true to enable)")
-    
+
     # Start dashboard updater
     if not update_dashboard.is_running():
         update_dashboard.start()
         print(f"✅ Dashboard updater started")
-    
+
     # Start link health monitor
     if not link_health_monitor.is_running():
         link_health_monitor.start()
         print(f"✅ Link health monitor started (checks daily)")
-    
+
     # Start auto-backup
     if not auto_backup.is_running():
         auto_backup.start()
         print(f"✅ Auto-backup started (runs daily)")
-    
+
     # Start Steam activity monitor
     if not steam_activity_monitor.is_running():
         steam_activity_monitor.start()
         print(f"✅ Steam activity monitor started (checks every 10 seconds)")
-    
+
     # Start Playwright queue processor
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
         print(f"✅ Playwright queue processor started")
-    
+
     # LAST: Update status to online after everything is loaded
     await update_status_message("online")
 

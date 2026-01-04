@@ -83,16 +83,25 @@ async def handle_github_webhook(request):
 
 def setup_github_webhook_server():
     print("setup_github_webhook_server() called")  # <--- Add this line
+    print("Before creating aiohttp app")
     app = web.Application()
     app.router.add_post('/github', handle_github_webhook)
     runner = web.AppRunner(app)
     loop = asyncio.get_event_loop()
+    print("Before defining start() async function")
     async def start():
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 8080)
-        await site.start()
-        print("GitHub webhook server running on port 8080")
+        print("Entered start() async function")
+        try:
+            await runner.setup()
+            print("Runner setup complete")
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            print("GitHub webhook server running on port 8080")
+        except Exception as e:
+            print(f"Exception in webhook server start(): {e}")
+    print("Before scheduling start() task")
     loop.create_task(start())
+    print("After scheduling start() task")
 
 ## Remove duplicate on_ready and merge logic below
 bot.collections = {}  # Track user collections (user_id: {collection_name: [thread_ids]})

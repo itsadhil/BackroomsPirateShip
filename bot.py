@@ -1,8 +1,10 @@
+
 import os
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp import web
 from typing import Optional, Dict, Any, List
 import re
 import io
@@ -58,6 +60,44 @@ bot.game_tags = {}  # Track game tags (thread_id: [tags])
 bot.link_health = {}  # Track link health (thread_id: {checked_at, status, broken_links})
 bot.trending_views = {}  # Track thread views for trending (thread_id: view_count)
 bot.webhooks = {}  # Track webhook URLs (user_id: webhook_url)
+
+# ========== GITHUB WEBHOOK SERVER ==========
+GITHUB_DISCORD_CHANNEL_ID = 1457161296750444595  # Channel to post GitHub events
+
+async def handle_github_webhook(request):
+    try:
+        data = await request.json()
+        # Handle push events
+        if 'commits' in data and 'repository' in data:
+            repo = data['repository']['full_name']
+            pusher = data.get('pusher', {}).get('name', 'unknown')
+            commit_msgs = "\n".join([f"[`{c['id'][:7]}`] {c['message']} (<{c['url']}>)" for c in data['commits']])
+            msg = f"**[{repo}]** New push by **{pusher}**:\n{commit_msgs}"
+            channel = bot.get_channel(GITHUB_DISCORD_CHANNEL_ID)
+            if channel:
+                await channel.send(msg)
+        # You can add more event types here (pull_request, issues, etc.)
+    except Exception as e:
+        print(f"GitHub webhook error: {e}")
+    return web.Response(text="OK")
+
+def setup_github_webhook_server():
+    app = web.Application()
+    app.router.add_post('/github', handle_github_webhook)
+    runner = web.AppRunner(app)
+    loop = asyncio.get_event_loop()
+    async def start():
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', 8080)
+        await site.start()
+        print("GitHub webhook server running on port 8080")
+    loop.create_task(start())
+
+# Call this after bot is ready
+@bot.event
+async def on_ready():
+    setup_github_webhook_server()
+    print(f"Bot is ready. Logged in as {bot.user}")
 bot.collections = {}  # Track user collections (user_id: {collection_name: [thread_ids]})
 bot.bookmarks = {}  # Track user bookmarks (user_id: [thread_ids])
 bot.compatibility_reports = {}  # Track compatibility reports (thread_id: [{user_id, status, specs, notes}])

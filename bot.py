@@ -41,7 +41,7 @@ ADMIN_ROLE_ID = 1072117821397540954 # Admin role that can use commands anywhere
 intents = discord.Intents.default()
 intents.message_content = True
 
-# ---------aaaaaaaaaasdasdas----------------
+# -------------------------
 # BOT SETUP
 # -------------------------
 bot = commands.Bot(command_prefix="!", intents=intents)

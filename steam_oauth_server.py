@@ -1,25 +1,42 @@
 """
-Steam OAuth Web Server
-Handles Steam OpenID authentication callbacks
+Improved Steam OAuth Web Server
+Handles Steam OpenID authentication callbacks with better session management
 """
-
 from flask import Flask, request, redirect, render_template_string
-from openid.consumer import consumer
-from openid.extensions import sreg
 import os
 import json
 import re
+import secrets
+import time
 from threading import Thread
-from steam_utils import SteamLinker
+from typing import Dict, Optional
+import logging
+
+# Use improved steam linker
+from utils.steam_linker import SteamLinker
+from config.settings import settings
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', secrets.token_urlsafe(32))
 
-# Store pending authentication sessions
-pending_auth = {}
+# Store pending authentication sessions with expiration
+pending_auth: Dict[str, dict] = {}
+SESSION_TIMEOUT = 300  # 5 minutes
 
-# OAuth callback URL - will be set from env
-CALLBACK_URL = os.getenv('STEAM_OAUTH_CALLBACK_URL', 'http://localhost:5000/auth/callback')
+def cleanup_expired_sessions():
+    """Remove expired sessions."""
+    current_time = time.time()
+    expired = [
+        session_id for session_id, session_data in pending_auth.items()
+        if current_time - session_data.get('created_at', 0) > SESSION_TIMEOUT
+    ]
+    for session_id in expired:
+        del pending_auth[session_id]
+        logger.debug(f"Removed expired session: {session_id}")
 
 SUCCESS_PAGE = """
 <!DOCTYPE html>
@@ -148,8 +165,8 @@ ERROR_PAGE = """
 </html>
 """
 
-def get_steam_id_from_url(url):
-    """Extract Steam ID from OpenID identity URL"""
+def get_steam_id_from_url(url: str) -> Optional[str]:
+    """Extract Steam ID from OpenID identity URL."""
     match = re.search(r'steamcommunity.com/openid/id/(\d+)', url)
     if match:
         return match.group(1)
@@ -165,23 +182,27 @@ def test():
 
 @app.route('/auth/login')
 def login():
-    """Initiate Steam OpenID authentication"""
+    """Initiate Steam OpenID authentication."""
     discord_id = request.args.get('discord_id')
     
     if not discord_id:
         return "Missing discord_id parameter", 400
     
-    # Store the Discord ID for when they return
-    session_id = os.urandom(16).hex()
-    pending_auth[session_id] = discord_id
+    # Cleanup expired sessions
+    cleanup_expired_sessions()
+    
+    # Generate cryptographically secure session ID
+    session_id = secrets.token_urlsafe(32)
+    pending_auth[session_id] = {
+        'discord_id': discord_id,
+        'created_at': time.time()
+    }
     
     # Build proper realm and return_to URLs
-    # realm should be the base URL (e.g., http://localhost:5000)
     realm = f"http://{request.host}"
-    return_to = f"{CALLBACK_URL}?session={session_id}"
+    return_to = f"{settings.STEAM_OAUTH_CALLBACK_URL}?session={session_id}"
     
-    print(f"[DEBUG] Realm: {realm}")
-    print(f"[DEBUG] Return to: {return_to}")
+    logger.info(f"Starting Steam auth for Discord ID: {discord_id}")
     
     # Build OpenID parameters manually (Steam's stateless OpenID)
     params = {
@@ -197,83 +218,102 @@ def login():
     from urllib.parse import urlencode
     steam_login_url = f"https://steamcommunity.com/openid/login?{urlencode(params)}"
     
-    print(f"[DEBUG] Redirecting to: {steam_login_url}")
-    
     return redirect(steam_login_url)
 
 @app.route('/auth/callback')
 def callback():
-    """Handle Steam OpenID callback"""
+    """Handle Steam OpenID callback."""
     try:
-        print(f"[DEBUG] Callback received with args: {dict(request.args)}")
+        cleanup_expired_sessions()
         
         session_id = request.args.get('session')
         
         if not session_id or session_id not in pending_auth:
-            print(f"[ERROR] Invalid session: {session_id}")
+            logger.warning(f"Invalid session: {session_id}")
             return render_template_string(ERROR_PAGE, error_message="Invalid or expired session.")
         
-        discord_id = pending_auth[session_id]
-        print(f"[DEBUG] Discord ID: {discord_id}")
+        session_data = pending_auth[session_id]
+        discord_id = session_data['discord_id']
         
         # Validate OpenID response manually
         mode = request.args.get('openid.mode')
-        print(f"[DEBUG] OpenID mode: {mode}")
         
         if mode == 'cancel':
+            del pending_auth[session_id]
             return render_template_string(ERROR_PAGE, error_message="You cancelled the Steam login.")
         
         if mode != 'id_res':
+            del pending_auth[session_id]
             return render_template_string(ERROR_PAGE, error_message="Invalid OpenID response mode.")
         
         # Get claimed identity
         claimed_id = request.args.get('openid.claimed_id', '')
-        print(f"[DEBUG] Claimed ID: {claimed_id}")
         
         # Verify the response with Steam
         validation_params = dict(request.args.items())
         validation_params['openid.mode'] = 'check_authentication'
         
-        print(f"[DEBUG] Validating with Steam...")
         import requests
-        validation_response = requests.post('https://steamcommunity.com/openid/login', data=validation_params, timeout=10)
-        print(f"[DEBUG] Steam validation response: {validation_response.text[:200]}")
-        
-        if 'is_valid:true' not in validation_response.text:
-            print(f"[ERROR] Validation failed")
-            return render_template_string(ERROR_PAGE, error_message="Steam authentication validation failed.")
+        try:
+            validation_response = requests.post(
+                'https://steamcommunity.com/openid/login',
+                data=validation_params,
+                timeout=10
+            )
+            
+            if 'is_valid:true' not in validation_response.text:
+                logger.error("Steam validation failed")
+                del pending_auth[session_id]
+                return render_template_string(
+                    ERROR_PAGE,
+                    error_message="Steam authentication validation failed."
+                )
+        except Exception as e:
+            logger.error(f"Error validating with Steam: {e}", exc_info=True)
+            del pending_auth[session_id]
+            return render_template_string(
+                ERROR_PAGE,
+                error_message="Could not verify authentication with Steam."
+            )
         
         # Extract Steam ID from claimed_id
         steam_id = get_steam_id_from_url(claimed_id)
-        print(f"[DEBUG] Extracted Steam ID: {steam_id}")
         
         if not steam_id:
-            return render_template_string(ERROR_PAGE, error_message="Could not extract Steam ID from response.")
+            del pending_auth[session_id]
+            return render_template_string(
+                ERROR_PAGE,
+                error_message="Could not extract Steam ID from response."
+            )
         
         # Link the accounts
-        SteamLinker.link_account(discord_id, steam_id)
-        print(f"[SUCCESS] Linked Discord {discord_id} to Steam {steam_id}")
+        if SteamLinker.link_account(discord_id, steam_id):
+            logger.info(f"Successfully linked Discord {discord_id} to Steam {steam_id}")
+        else:
+            logger.error(f"Failed to save Steam link for {discord_id}")
         
         # Clean up session
         del pending_auth[session_id]
         
-        # Get Steam name
+        # Get Steam name (optional - could fetch from API)
         steam_name = f"Steam User {steam_id}"
         
         return render_template_string(SUCCESS_PAGE, steam_name=steam_name)
     
     except Exception as e:
-        import traceback
-        print(f"[ERROR] Exception in callback:")
-        traceback.print_exc()
+        logger.error(f"Exception in callback: {e}", exc_info=True)
+        if session_id and session_id in pending_auth:
+            del pending_auth[session_id]
         return render_template_string(ERROR_PAGE, error_message=f"Error: {str(e)}")
 
 def run_server(host='0.0.0.0', port=5000):
-    """Run the Flask server"""
+    """Run the Flask server."""
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 def start_oauth_server(host='0.0.0.0', port=5000):
-    """Start OAuth server in a separate thread"""
+    """Start OAuth server in a separate thread."""
     thread = Thread(target=run_server, kwargs={'host': host, 'port': port}, daemon=True)
     thread.start()
+    logger.info(f"Steam OAuth server thread started on port {port}")
     return thread
+

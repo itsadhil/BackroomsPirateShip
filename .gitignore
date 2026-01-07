@@ -41,5 +41,8 @@ Thumbs.db
 debug_*.html
 *.tmp
 
+# Documentation files
+*.md
+
 # Cogs (if you want to keep them local for now)
 cogs/

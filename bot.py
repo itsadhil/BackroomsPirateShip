@@ -1,5 +1,6 @@
 
 import os
+import sys
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -16,24 +17,43 @@ import feedparser
 import json
 from datetime import datetime
 
-# -------------------------
-# LOAD ENV
-# -------------------------
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
-TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+# Setup logging first
+from utils.logging_config import setup_logging, get_logger
+from config.settings import settings
+
+# Initialize logging
+setup_logging(settings.LOG_LEVEL, settings.LOG_FILE)
+logger = get_logger(__name__)
+
+# Import new utilities
+from utils.data_manager import data_manager
+from utils.http_client import get_http_session, close_http_sessions
+from utils.browser_pool import get_browser_pool, close_browser_pool
+from utils.api_clients import IGDBClient, RAWGClient
+from utils.steam_api import SteamAPI, format_playtime, get_personastate_string
+from utils.steam_linker import SteamLinker
+from utils.retry import retry
+from utils.rate_limiter import get_steam_limiter, get_igdb_limiter
 
 # -------------------------
-# CONFIG (REPLACE IDS)
+# LOAD ENV (for backward compatibility)
 # -------------------------
-GUILD_ID = 1053630118360260650
-INPUT_CHANNEL_ID = 1456371838325096733
-OUTPUT_CHANNEL_ID = 1456386547879514317 # This should be a FORUM CHANNEL
-REQUEST_CHANNEL_ID = 1456387358952919132 # Channel for game requests
-DASHBOARD_CHANNEL_ID = 1456480472128425985 # UI/Dashboard channel
-ALLOWED_CHANNEL_ID = 1456371610473988388 # Channel where non-admins can use commands
-ADMIN_ROLE_ID = 1072117821397540954 # Admin role that can use commands anywhere
+load_dotenv()
+TOKEN = settings.DISCORD_TOKEN
+TWITCH_CLIENT_ID = settings.TWITCH_CLIENT_ID
+TWITCH_CLIENT_SECRET = settings.TWITCH_CLIENT_SECRET
+
+# -------------------------
+# CONFIG (from settings)
+# -------------------------
+GUILD_ID = settings.GUILD_ID
+INPUT_CHANNEL_ID = settings.INPUT_CHANNEL_ID
+OUTPUT_CHANNEL_ID = settings.OUTPUT_CHANNEL_ID
+REQUEST_CHANNEL_ID = settings.REQUEST_CHANNEL_ID
+DASHBOARD_CHANNEL_ID = settings.DASHBOARD_CHANNEL_ID
+ALLOWED_CHANNEL_ID = settings.ALLOWED_CHANNEL_ID
+ADMIN_ROLE_ID = settings.ADMIN_ROLE_ID
+GITHUB_DISCORD_CHANNEL_ID = settings.GITHUB_DISCORD_CHANNEL_ID
 
 # -------------------------
 # INTENTS
@@ -122,203 +142,179 @@ bot.playwright_queue = asyncio.Queue()  # Queue for download requests
 bot.playwright_active = False  # Track if Playwright is currently running
 bot.queue_position = {}  # Track position in queue for users
 
-# Files for persistent storage
-RSS_SEEN_FILE = "fitgirl_seen_posts.json"
-BOT_STATE_FILE = "bot_state.json"
-USER_DATA_FILE = "user_data.json"
-REVIEWS_FILE = "reviews_data.json"
-TAGS_FILE = "tags_data.json"
-HEALTH_FILE = "link_health_data.json"
-WEBHOOKS_FILE = "webhooks_data.json"
-COLLECTIONS_FILE = "collections_data.json"
-COMPATIBILITY_FILE = "compatibility_data.json"
+# Files for persistent storage (using data_manager)
+# Data manager handles all file operations safely
 
 # Load previously seen posts
 def load_seen_posts():
     try:
-        if os.path.exists(RSS_SEEN_FILE):
-            with open(RSS_SEEN_FILE, 'r') as f:
-                bot.seen_rss_posts = set(json.load(f))
-                print(f"✅ Loaded {len(bot.seen_rss_posts)} seen RSS posts")
+        data_manager.load_all()
+        bot.seen_rss_posts = data_manager.seen_rss_posts
+        logger.info(f"✅ Loaded {len(bot.seen_rss_posts)} seen RSS posts")
     except Exception as e:
-        print(f"⚠️ Could not load seen posts: {e}")
+        logger.error(f"⚠️ Could not load seen posts: {e}", exc_info=True)
 
 def save_seen_posts():
     try:
-        with open(RSS_SEEN_FILE, 'w') as f:
-            json.dump(list(bot.seen_rss_posts), f)
+        data_manager.seen_rss_posts = bot.seen_rss_posts
+        data_manager.save_seen_posts()
     except Exception as e:
-        print(f"⚠️ Could not save seen posts: {e}")
+        logger.error(f"⚠️ Could not save seen posts: {e}", exc_info=True)
 
 # Load bot state (dashboard ID, contributor stats)
 def load_bot_state():
     try:
-        if os.path.exists(BOT_STATE_FILE):
-            with open(BOT_STATE_FILE, 'r') as f:
-                state = json.load(f)
-                bot.dashboard_message_id = state.get('dashboard_message_id')
-                bot.contributor_stats = state.get('contributor_stats', {})
-                bot.status_message_id = state.get('status_message_id')
-                print(f"✅ Loaded bot state (Dashboard ID: {bot.dashboard_message_id}, Contributors: {len(bot.contributor_stats)})")
+        data_manager.load_all()
+        bot.dashboard_message_id = data_manager.bot_state.get('dashboard_message_id')
+        bot.contributor_stats = data_manager.bot_state.get('contributor_stats', {})
+        bot.status_message_id = data_manager.bot_state.get('status_message_id')
+        logger.info(f"✅ Loaded bot state (Dashboard ID: {bot.dashboard_message_id}, Contributors: {len(bot.contributor_stats)})")
     except Exception as e:
-        print(f"⚠️ Could not load bot state: {e}")
+        logger.error(f"⚠️ Could not load bot state: {e}", exc_info=True)
 
 def save_bot_state():
     try:
-        state = {
-            'dashboard_message_id': bot.dashboard_message_id,
-            'contributor_stats': bot.contributor_stats,
-            'status_message_id': bot.status_message_id,
-            'last_updated': discord.utils.utcnow().isoformat()
-        }
-        with open(BOT_STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-        print(f"💾 Bot state saved (Dashboard: {bot.dashboard_message_id})")
+        data_manager.bot_state['dashboard_message_id'] = bot.dashboard_message_id
+        data_manager.bot_state['contributor_stats'] = bot.contributor_stats
+        data_manager.bot_state['status_message_id'] = bot.status_message_id
+        data_manager.bot_state['last_updated'] = discord.utils.utcnow().isoformat()
+        data_manager.save_bot_state()
+        logger.debug(f"💾 Bot state saved (Dashboard: {bot.dashboard_message_id})")
     except Exception as e:
-        print(f"⚠️ Could not save bot state: {e}")
+        logger.error(f"⚠️ Could not save bot state: {e}", exc_info=True)
 
 def load_user_data():
     """Load user-related data (libraries, notifications, votes, download stats)."""
     try:
-        if os.path.exists(USER_DATA_FILE):
-            with open(USER_DATA_FILE, 'r') as f:
-                data = json.load(f)
-                bot.download_stats = {int(k): v for k, v in data.get('download_stats', {}).items()}
-                bot.user_libraries = {int(k): v for k, v in data.get('user_libraries', {}).items()}
-                bot.game_notifications = data.get('game_notifications', {})
-                bot.request_votes = {int(k): v for k, v in data.get('request_votes', {}).items()}
-                bot.trending_views = {int(k): v for k, v in data.get('trending_views', {}).items()}
-                bot.bookmarks = {int(k): v for k, v in data.get('bookmarks', {}).items()}
-                bot.user_preferences = {int(k): v for k, v in data.get('user_preferences', {}).items()}
-                print(f"✅ Loaded user data (Libraries: {len(bot.user_libraries)}, Notifications: {len(bot.game_notifications)})")
+        data_manager.load_all()
+        user_data = data_manager.user_data
+        bot.download_stats = {int(k): v for k, v in user_data.get('download_stats', {}).items()}
+        bot.user_libraries = {int(k): v for k, v in user_data.get('user_libraries', {}).items()}
+        bot.game_notifications = user_data.get('game_notifications', {})
+        bot.request_votes = {int(k): v for k, v in user_data.get('request_votes', {}).items()}
+        bot.trending_views = {int(k): v for k, v in user_data.get('trending_views', {}).items()}
+        bot.bookmarks = {int(k): v for k, v in user_data.get('bookmarks', {}).items()}
+        bot.user_preferences = {int(k): v for k, v in user_data.get('user_preferences', {}).items()}
+        logger.info(f"✅ Loaded user data (Libraries: {len(bot.user_libraries)}, Notifications: {len(bot.game_notifications)})")
     except Exception as e:
-        print(f"⚠️ Could not load user data: {e}")
+        logger.error(f"⚠️ Could not load user data: {e}", exc_info=True)
 
 def save_user_data():
     """Save user-related data."""
     try:
-        data = {
-            'download_stats': {str(k): v for k, v in bot.download_stats.items()},
-            'user_libraries': {str(k): v for k, v in bot.user_libraries.items()},
-            'game_notifications': bot.game_notifications,
-            'request_votes': {str(k): v for k, v in bot.request_votes.items()},
-            'trending_views': {str(k): v for k, v in bot.trending_views.items()},
-            'bookmarks': {str(k): v for k, v in bot.bookmarks.items()},
-            'user_preferences': {str(k): v for k, v in bot.user_preferences.items()},
-            'last_updated': discord.utils.utcnow().isoformat()
-        }
-        with open(USER_DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+        data_manager.user_data['download_stats'] = {str(k): v for k, v in bot.download_stats.items()}
+        data_manager.user_data['user_libraries'] = {str(k): v for k, v in bot.user_libraries.items()}
+        data_manager.user_data['game_notifications'] = bot.game_notifications
+        data_manager.user_data['request_votes'] = {str(k): v for k, v in bot.request_votes.items()}
+        data_manager.user_data['trending_views'] = {str(k): v for k, v in bot.trending_views.items()}
+        data_manager.user_data['bookmarks'] = {str(k): v for k, v in bot.bookmarks.items()}
+        data_manager.user_data['user_preferences'] = {str(k): v for k, v in bot.user_preferences.items()}
+        data_manager.user_data['last_updated'] = discord.utils.utcnow().isoformat()
+        data_manager.save_user_data()
     except Exception as e:
-        print(f"⚠️ Could not save user data: {e}")
+        logger.error(f"⚠️ Could not save user data: {e}", exc_info=True)
 
 def load_reviews_data():
     """Load review data."""
     try:
-        if os.path.exists(REVIEWS_FILE):
-            with open(REVIEWS_FILE, 'r') as f:
-                bot.game_reviews = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded {len(bot.game_reviews)} game reviews")
+        data_manager.load_all()
+        bot.game_reviews = data_manager.reviews
+        logger.info(f"✅ Loaded {len(bot.game_reviews)} game reviews")
     except Exception as e:
-        print(f"⚠️ Could not load reviews data: {e}")
+        logger.error(f"⚠️ Could not load reviews data: {e}", exc_info=True)
 
 def save_reviews_data():
     """Save review data."""
     try:
-        with open(REVIEWS_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.game_reviews.items()}, f, indent=2)
+        data_manager.reviews = bot.game_reviews
+        data_manager.save_reviews()
     except Exception as e:
-        print(f"⚠️ Could not save reviews data: {e}")
+        logger.error(f"⚠️ Could not save reviews data: {e}", exc_info=True)
 
 def load_tags_data():
     """Load tags data."""
     try:
-        if os.path.exists(TAGS_FILE):
-            with open(TAGS_FILE, 'r') as f:
-                bot.game_tags = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded tags for {len(bot.game_tags)} games")
+        data_manager.load_all()
+        bot.game_tags = data_manager.tags
+        logger.info(f"✅ Loaded tags for {len(bot.game_tags)} games")
     except Exception as e:
-        print(f"⚠️ Could not load tags data: {e}")
+        logger.error(f"⚠️ Could not load tags data: {e}", exc_info=True)
 
 def save_tags_data():
     """Save tags data."""
     try:
-        with open(TAGS_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.game_tags.items()}, f, indent=2)
+        data_manager.tags = bot.game_tags
+        data_manager.save_tags()
     except Exception as e:
-        print(f"⚠️ Could not save tags data: {e}")
+        logger.error(f"⚠️ Could not save tags data: {e}", exc_info=True)
 
 def load_health_data():
     """Load link health data."""
     try:
-        if os.path.exists(HEALTH_FILE):
-            with open(HEALTH_FILE, 'r') as f:
-                bot.link_health = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded health data for {len(bot.link_health)} games")
+        data_manager.load_all()
+        bot.link_health = data_manager.health
+        logger.info(f"✅ Loaded health data for {len(bot.link_health)} games")
     except Exception as e:
-        print(f"⚠️ Could not load health data: {e}")
+        logger.error(f"⚠️ Could not load health data: {e}", exc_info=True)
 
 def save_health_data():
     """Save link health data."""
     try:
-        with open(HEALTH_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.link_health.items()}, f, indent=2)
+        data_manager.health = bot.link_health
+        data_manager.save_health()
     except Exception as e:
-        print(f"⚠️ Could not save health data: {e}")
+        logger.error(f"⚠️ Could not save health data: {e}", exc_info=True)
 
 def load_webhooks_data():
     """Load webhooks data."""
     try:
-        if os.path.exists(WEBHOOKS_FILE):
-            with open(WEBHOOKS_FILE, 'r') as f:
-                bot.webhooks = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded {len(bot.webhooks)} webhooks")
+        data_manager.load_all()
+        bot.webhooks = data_manager.webhooks
+        logger.info(f"✅ Loaded {len(bot.webhooks)} webhooks")
     except Exception as e:
-        print(f"⚠️ Could not load webhooks data: {e}")
+        logger.error(f"⚠️ Could not load webhooks data: {e}", exc_info=True)
 
 def save_webhooks_data():
     """Save webhooks data."""
     try:
-        with open(WEBHOOKS_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.webhooks.items()}, f, indent=2)
+        data_manager.webhooks = bot.webhooks
+        data_manager.save_webhooks()
     except Exception as e:
-        print(f"⚠️ Could not save webhooks data: {e}")
+        logger.error(f"⚠️ Could not save webhooks data: {e}", exc_info=True)
 
 def load_collections_data():
     """Load collections data."""
     try:
-        if os.path.exists(COLLECTIONS_FILE):
-            with open(COLLECTIONS_FILE, 'r') as f:
-                bot.collections = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded collections for {len(bot.collections)} users")
+        data_manager.load_all()
+        bot.collections = data_manager.collections
+        logger.info(f"✅ Loaded collections for {len(bot.collections)} users")
     except Exception as e:
-        print(f"⚠️ Could not load collections data: {e}")
+        logger.error(f"⚠️ Could not load collections data: {e}", exc_info=True)
 
 def save_collections_data():
     """Save collections data."""
     try:
-        with open(COLLECTIONS_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.collections.items()}, f, indent=2)
+        data_manager.collections = bot.collections
+        data_manager.save_collections()
     except Exception as e:
-        print(f"⚠️ Could not save collections data: {e}")
+        logger.error(f"⚠️ Could not save collections data: {e}", exc_info=True)
 
 def load_compatibility_data():
     """Load compatibility data."""
     try:
-        if os.path.exists(COMPATIBILITY_FILE):
-            with open(COMPATIBILITY_FILE, 'r') as f:
-                bot.compatibility_reports = {int(k): v for k, v in json.load(f).items()}
-                print(f"✅ Loaded compatibility reports for {len(bot.compatibility_reports)} games")
+        data_manager.load_all()
+        bot.compatibility_reports = data_manager.compatibility
+        logger.info(f"✅ Loaded compatibility reports for {len(bot.compatibility_reports)} games")
     except Exception as e:
-        print(f"⚠️ Could not load compatibility data: {e}")
+        logger.error(f"⚠️ Could not load compatibility data: {e}", exc_info=True)
 
 def save_compatibility_data():
     """Save compatibility data."""
     try:
-        with open(COMPATIBILITY_FILE, 'w') as f:
-            json.dump({str(k): v for k, v in bot.compatibility_reports.items()}, f, indent=2)
+        data_manager.compatibility = bot.compatibility_reports
+        data_manager.save_compatibility()
     except Exception as e:
-        print(f"⚠️ Could not save compatibility data: {e}")
+        logger.error(f"⚠️ Could not save compatibility data: {e}", exc_info=True)
 
 async def update_status_message(status: str):
     """Update or create the bot status message."""
@@ -375,10 +371,10 @@ async def update_status_message(status: str):
         message = await channel.send(embed=embed)
         bot.status_message_id = message.id
         save_bot_state()
-        print(f"✅ Created new status message: {status}")
+        logger.debug(f"Created new status message: {status}")
         
     except Exception as e:
-        print(f"⚠️ Error updating status message: {e}")
+        logger.error(f"Error updating status message: {e}", exc_info=True)
 
 # =========================================================
 # INVITE TO VC VIEW FOR STEAM NOTIFICATIONS
@@ -616,8 +612,9 @@ class IGDBClient:
         if self.session:
             await self.session.close()
 
-# Initialize IGDB client
-igdb_client = IGDBClient(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
+# Initialize IGDB and RAWG clients (using improved versions from utils)
+igdb_client = IGDBClient(settings.TWITCH_CLIENT_ID, settings.TWITCH_CLIENT_SECRET)
+rawg_client = RAWGClient()  # Initialize RAWG client
 
 # =========================================================
 # RAWG API CLIENT (FALLBACK)
@@ -676,8 +673,7 @@ class RAWGClient:
             print(f"⚠️ RAWG search error: {e}")
             return None
 
-# Initialize RAWG client
-rawg_client = RAWGClient()
+# RAWG client already initialized from imports
 
 # =========================================================
 # FITGIRL REPACKS SCRAPER
@@ -1177,9 +1173,8 @@ async def on_ready():
 
     # Start Steam OAuth server
     from steam_oauth_server import start_oauth_server
-    oauth_port = int(os.getenv('STEAM_OAUTH_PORT', '5000'))
-    start_oauth_server(port=oauth_port)
-    print(f"✅ Steam OAuth server started on port {oauth_port}")
+    start_oauth_server(port=settings.STEAM_OAUTH_PORT)
+    logger.info(f"✅ Steam OAuth server started on port {settings.STEAM_OAUTH_PORT}")
 
     # SECOND: Update status to show bot is starting (will edit existing message if found)
     await update_status_message("starting")
@@ -1188,8 +1183,15 @@ async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
-    print(f"✅ Logged in as {bot.user}")
-    print(f"✅ Commands synced to guild ID: {GUILD_ID}")
+    logger.info(f"✅ Logged in as {bot.user}")
+    logger.info(f"✅ Commands synced to guild ID: {GUILD_ID}")
+    
+    # Initialize browser pool
+    try:
+        await get_browser_pool().initialize()
+        logger.info("Browser pool initialized")
+    except Exception as e:
+        logger.error(f"Error initializing browser pool: {e}", exc_info=True)
 
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
@@ -1230,17 +1232,37 @@ async def on_ready():
 @bot.event
 async def on_close():
     """Clean up resources on bot shutdown."""
-    await update_status_message("restarting")
-    await igdb_client.close()
-    save_seen_posts()
-    save_bot_state()
-    save_user_data()
-    save_reviews_data()
-    save_tags_data()
-    save_health_data()
-    save_webhooks_data()
-    save_collections_data()
-    save_compatibility_data()
+    logger.info("Bot shutting down, cleaning up resources...")
+    try:
+        await update_status_message("restarting")
+    except:
+        pass
+    
+    # Save all data
+    try:
+        data_manager.save_all()
+    except Exception as e:
+        logger.error(f"Error saving data: {e}", exc_info=True)
+    
+    # Close HTTP sessions
+    try:
+        await close_http_sessions()
+    except Exception as e:
+        logger.error(f"Error closing HTTP sessions: {e}", exc_info=True)
+    
+    # Close browser pool
+    try:
+        await close_browser_pool()
+    except Exception as e:
+        logger.error(f"Error closing browser pool: {e}", exc_info=True)
+    
+    # Close IGDB client
+    try:
+        await igdb_client.close()
+    except Exception as e:
+        logger.error(f"Error closing IGDB client: {e}", exc_info=True)
+    
+    logger.info("Cleanup complete")
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -1744,14 +1766,14 @@ async def auto_backup():
         # Create backups directory if it doesn't exist
         os.makedirs("backups", exist_ok=True)
         
-        # Files to backup
+        # Files to backup (using data/ directory)
         files_to_backup = [
-            RSS_SEEN_FILE,
-            BOT_STATE_FILE,
-            USER_DATA_FILE,
-            REVIEWS_FILE,
-            TAGS_FILE,
-            HEALTH_FILE
+            str(settings.RSS_SEEN_FILE),
+            str(settings.BOT_STATE_FILE),
+            str(settings.USER_DATA_FILE),
+            str(settings.REVIEWS_FILE),
+            str(settings.TAGS_FILE),
+            str(settings.HEALTH_FILE)
         ]
         
         # Create zip file
@@ -1795,7 +1817,6 @@ async def steam_activity_monitor():
             return
         
         # Get all linked Steam accounts
-        from steam_utils import SteamLinker, SteamAPI
         steam_links = SteamLinker.load_links()
         
         if not steam_links:
@@ -5347,14 +5368,14 @@ async def backup(interaction: discord.Interaction):
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         backup_filename = f"backup_{timestamp}.zip"
         
-        # Files to backup
+        # Files to backup (using data/ directory)
         files_to_backup = [
-            RSS_SEEN_FILE,
-            BOT_STATE_FILE,
-            USER_DATA_FILE,
-            REVIEWS_FILE,
-            TAGS_FILE,
-            HEALTH_FILE
+            str(settings.RSS_SEEN_FILE),
+            str(settings.BOT_STATE_FILE),
+            str(settings.USER_DATA_FILE),
+            str(settings.REVIEWS_FILE),
+            str(settings.TAGS_FILE),
+            str(settings.HEALTH_FILE)
         ]
         
         # Create zip file
@@ -5949,7 +5970,7 @@ async def recommend(interaction: discord.Interaction):
 # -------------------------
 # STEAM INTEGRATION
 # -------------------------
-from steam_utils import SteamAPI, SteamLinker, format_playtime, get_personastate_string
+# Steam utilities already imported at top
 
 @bot.tree.command(name="linksteam", description="Link your Discord account to your Steam account")
 async def linksteam(interaction: discord.Interaction):

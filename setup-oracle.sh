@@ -85,7 +85,11 @@ pip install -r requirements.txt
 
 # Step 8: Install Playwright browsers
 echo -e "${GREEN}[8/8] Installing Playwright browsers...${NC}"
-playwright install chromium
+python -m playwright install --with-deps chromium
+
+# Step 9: Create data and logs directories
+echo -e "${GREEN}[9/9] Creating data directories...${NC}"
+mkdir -p data logs
 
 echo ""
 echo -e "${GREEN}=========================================="
@@ -102,13 +106,16 @@ echo "   TWITCH_CLIENT_ID=your_id_here"
 echo "   TWITCH_CLIENT_SECRET=your_secret_here"
 echo "   ENABLE_RSS_AUTO=true"
 echo ""
-echo "3. Test run the bot:"
+echo "3. Run data migration (if needed):"
 echo "   cd ~/BackroomsPirateShip"
 echo "   source venv/bin/activate"
+echo "   python3 migrate_data.py"
+echo ""
+echo "4. Test run the bot:"
 echo "   python3 bot.py"
 echo ""
-echo "4. Setup systemd service (auto-start):"
+echo "5. Setup systemd service (auto-start):"
 echo "   sudo nano /etc/systemd/system/discord-bot.service"
-echo "   (See ORACLE_SETUP.md for service file content)"
+echo "   (See discord-bot.service file for content)"
 echo ""
 echo -e "${YELLOW}Need help? Check ORACLE_SETUP.md for detailed instructions!${NC}"

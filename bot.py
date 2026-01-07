@@ -1282,7 +1282,20 @@ async def on_ready():
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
         print(f"✅ Playwright queue processor started")
-
+    
+    # Start Minecraft monitoring tasks
+    if not minecraft_auto_restart_monitor.is_running():
+        minecraft_auto_restart_monitor.start()
+        print(f"✅ Minecraft auto-restart monitor started")
+    
+    if not minecraft_player_notifications.is_running():
+        minecraft_player_notifications.start()
+        print(f"✅ Minecraft player notifications started")
+    
+    if not minecraft_scheduled_backups.is_running():
+        minecraft_scheduled_backups.start()
+        print(f"✅ Minecraft scheduled backups monitor started")
+    
     # LAST: Update status to online after everything is loaded
     await update_status_message("online")
 
@@ -7353,6 +7366,14 @@ bot.mc_console_channel = None
 bot.mc_console_enabled = False
 bot.mc_last_log_line = None
 
+# New Minecraft features
+bot.mc_notification_channel = None  # Channel for player join/leave notifications
+bot.mc_auto_restart_enabled = True  # Auto-restart on crash
+bot.mc_scheduled_backups = {}  # {guild_id: {enabled: bool, interval_hours: int, last_backup: datetime}}
+bot.mc_scheduled_restarts = {}  # {guild_id: {enabled: bool, time: str, days: list}}
+bot.mc_player_activity = {}  # Track player sessions and playtime
+bot.mc_last_restart_check = None  # Track last restart check time
+
 async def is_minecraft_running():
     """Check if Minecraft server is running (systemd or screen)"""
     # Check systemd
@@ -8202,6 +8223,304 @@ async def track_minecraft_activity():
     except Exception as e:
         print(f"Error tracking MC activity: {e}")
 
+# =========================================================
+# MINECRAFT PLAYER MANAGEMENT
+# =========================================================
+@bot.tree.command(name="mckick", description="Kick a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to kick", reason="Reason for kick")
+async def mckick(interaction: discord.Interaction, player: str, reason: str = "No reason provided"):
+    """Kick a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send kick command
+        kick_cmd = f"screen -S minecraft -X stuff 'kick {player} {reason}\\n'"
+        process = await asyncio.create_subprocess_shell(
+            kick_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="👢 Player Kicked",
+            description=f"**{player}** has been kicked from the server.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Kicked by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcban", description="Ban a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to ban", reason="Reason for ban")
+async def mcban(interaction: discord.Interaction, player: str, reason: str = "No reason provided"):
+    """Ban a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send ban command
+        ban_cmd = f"screen -S minecraft -X stuff 'ban {player} {reason}\\n'"
+        process = await asyncio.create_subprocess_shell(
+            ban_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="🔨 Player Banned",
+            description=f"**{player}** has been banned from the server.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Banned by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcunban", description="Unban a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to unban")
+async def mcunban(interaction: discord.Interaction, player: str):
+    """Unban a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send unban command
+        unban_cmd = f"screen -S minecraft -X stuff 'unban {player}\\n'"
+        process = await asyncio.create_subprocess_shell(
+            unban_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="✅ Player Unbanned",
+            description=f"**{player}** has been unbanned from the server.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Unbanned by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT CONFIGURATION COMMANDS
+# =========================================================
+@bot.tree.command(name="mcnotify", description="Set channel for Minecraft player notifications (Admin only)")
+@discord.app_commands.describe(channel="Discord channel for notifications (leave empty to disable)")
+async def mcnotify(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Configure player join/leave notifications"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if channel:
+            bot.mc_notification_channel = channel.id
+            embed = discord.Embed(
+                title="✅ Notifications Enabled",
+                description=f"Player join/leave notifications will be sent to {channel.mention}",
+                color=discord.Color.green()
+            )
+            
+            # Start notification task if not running
+            if not minecraft_player_notifications.is_running():
+                minecraft_player_notifications.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            bot.mc_notification_channel = None
+            embed = discord.Embed(
+                title="❌ Notifications Disabled",
+                description="Player notifications have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcautorestart", description="Enable/disable auto-restart on crash (Admin only)")
+@discord.app_commands.describe(enabled="Enable auto-restart")
+async def mcautorestart(interaction: discord.Interaction, enabled: bool):
+    """Configure auto-restart on crash"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        bot.mc_auto_restart_enabled = enabled
+        
+        embed = discord.Embed(
+            title="✅ Auto-Restart " + ("Enabled" if enabled else "Disabled"),
+            description=f"Auto-restart on crash is now **{'enabled' if enabled else 'disabled'}**.",
+            color=discord.Color.green() if enabled else discord.Color.red()
+        )
+        
+        if enabled:
+            # Start monitor if not running
+            if not minecraft_auto_restart_monitor.is_running():
+                minecraft_auto_restart_monitor.start()
+            embed.add_field(
+                name="How it works",
+                value="The bot will monitor the server every minute and automatically restart it if it crashes.",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcautobackup", description="Configure automatic backups (Admin only)")
+@discord.app_commands.describe(enabled="Enable automatic backups", interval_hours="Hours between backups (default: 24)")
+async def mcautobackup(interaction: discord.Interaction, enabled: bool, interval_hours: int = 24):
+    """Configure scheduled backups"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            if guild_id not in bot.mc_scheduled_backups:
+                bot.mc_scheduled_backups[guild_id] = {}
+            
+            bot.mc_scheduled_backups[guild_id]['enabled'] = True
+            bot.mc_scheduled_backups[guild_id]['interval_hours'] = max(1, interval_hours)  # Minimum 1 hour
+            
+            embed = discord.Embed(
+                title="✅ Automatic Backups Enabled",
+                description=f"Backups will be created every **{interval_hours} hours**.",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Backup Location", value="`~/minecraft-backups/`", inline=False)
+            
+            # Start backup task if not running
+            if not minecraft_scheduled_backups.is_running():
+                minecraft_scheduled_backups.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_scheduled_backups:
+                bot.mc_scheduled_backups[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Automatic Backups Disabled",
+                description="Scheduled backups have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcplaytime", description="View player playtime statistics")
+@discord.app_commands.describe(player="Player username (leave empty for all players)")
+async def mcplaytime(interaction: discord.Interaction, player: str = None):
+    """View player playtime"""
+    await interaction.response.defer()
+    
+    try:
+        if player:
+            # Show specific player stats
+            if player not in bot.mc_player_activity:
+                await interaction.followup.send(f"❌ No data found for **{player}**")
+                return
+            
+            stats = bot.mc_player_activity[player]
+            total_hours = stats['total_time'] / 3600
+            sessions = stats.get('sessions', 0)
+            
+            embed = discord.Embed(
+                title=f"📊 Playtime: {player}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Total Playtime", value=f"{total_hours:.1f} hours", inline=True)
+            embed.add_field(name="Sessions", value=str(sessions), inline=True)
+            
+            if 'last_join' in stats:
+                embed.add_field(name="Status", value="🟢 Currently Online", inline=False)
+            else:
+                embed.add_field(name="Status", value="🔴 Offline", inline=False)
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            # Show top players
+            if not bot.mc_player_activity:
+                await interaction.followup.send("❌ No player data available yet.")
+                return
+            
+            # Sort by playtime
+            sorted_players = sorted(
+                bot.mc_player_activity.items(),
+                key=lambda x: x[1].get('total_time', 0),
+                reverse=True
+            )[:10]  # Top 10
+            
+            player_list = []
+            for i, (name, stats) in enumerate(sorted_players, 1):
+                hours = stats['total_time'] / 3600
+                sessions = stats.get('sessions', 0)
+                status = "🟢" if 'last_join' in stats else "🔴"
+                player_list.append(f"{i}. {status} **{name}** - {hours:.1f}h ({sessions} sessions)")
+            
+            embed = discord.Embed(
+                title="📊 Top Players by Playtime",
+                description="\n".join(player_list) if player_list else "No data available",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="Based on tracked sessions")
+            embed.timestamp = discord.utils.utcnow()
+            
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
 @bot.tree.command(name="mcstats", description="View player activity statistics")
 async def botstats(interaction: discord.Interaction):
     """Show bot statistics"""
@@ -8363,8 +8682,8 @@ async def minecraft_console_stream():
         # Keep only recent hashes to avoid memory bloat
         if len(bot.mc_processed_lines) > 500:
             bot.mc_processed_lines.clear()
-            
-            for line in new_lines:
+        
+        for line in new_lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -8418,6 +8737,244 @@ async def minecraft_console_stream():
 
 @minecraft_console_stream.before_loop
 async def before_console_stream():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT AUTO-RESTART MONITOR
+# =========================================================
+@tasks.loop(minutes=1)
+async def minecraft_auto_restart_monitor():
+    """Monitor server and auto-restart if crashed"""
+    try:
+        if not bot.mc_auto_restart_enabled:
+            return
+        
+        # Check if server should be running but isn't
+        was_running = getattr(bot, 'mc_was_running', False)
+        is_running = await is_minecraft_running()
+        
+        # If server was running but now isn't, it crashed
+        if was_running and not is_running:
+            logger.warning("⚠️ Minecraft server appears to have crashed! Attempting auto-restart...")
+            
+            # Try to restart
+            try:
+                start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+                process = await asyncio.create_subprocess_shell(
+                    start_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                await asyncio.sleep(2)
+                
+                # Send notification if channel is set
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="🔄 Server Auto-Restarted",
+                            description="The Minecraft server crashed and has been automatically restarted.",
+                            color=discord.Color.orange()
+                        )
+                        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=False)
+                        embed.set_footer(text="Auto-restart system")
+                        await channel.send(embed=embed)
+                
+                logger.info("✅ Minecraft server auto-restarted successfully")
+            except Exception as e:
+                logger.error(f"❌ Failed to auto-restart server: {e}", exc_info=True)
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        await channel.send(f"❌ **Server Crash Detected**\nFailed to auto-restart: {str(e)}")
+        
+        # Update running state
+        bot.mc_was_running = is_running
+        
+    except Exception as e:
+        logger.error(f"Error in auto-restart monitor: {e}", exc_info=True)
+
+@minecraft_auto_restart_monitor.before_loop
+async def before_auto_restart_monitor():
+    await bot.wait_until_ready()
+    # Initialize state
+    bot.mc_was_running = await is_minecraft_running()
+
+# =========================================================
+# MINECRAFT PLAYER NOTIFICATIONS
+# =========================================================
+@tasks.loop(seconds=5)
+async def minecraft_player_notifications():
+    """Send Discord notifications for player join/leave"""
+    try:
+        if not bot.mc_notification_channel:
+            return
+        
+        if not await is_minecraft_running():
+            return
+        
+        channel = bot.get_channel(bot.mc_notification_channel)
+        if not channel:
+            return
+        
+        # Track last seen players
+        if not hasattr(bot, 'mc_last_seen_players'):
+            bot.mc_last_seen_players = set()
+        
+        # Get current online players from logs
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager | grep -E 'Player connected|Player disconnected'"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        logs = logs_stdout.decode()
+        
+        current_players = set()
+        for line in logs.split('\n'):
+            if 'Player connected:' in line:
+                try:
+                    player = line.split('Player connected:')[-1].strip().split(',')[0].strip()
+                    if player and player not in bot.mc_last_seen_players:
+                        # New player joined
+                        embed = discord.Embed(
+                            title="🟢 Player Joined",
+                            description=f"**{player}** joined the server!",
+                            color=discord.Color.green()
+                        )
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                        bot.mc_last_seen_players.add(player)
+                        
+                        # Track activity
+                        if player not in bot.mc_player_activity:
+                            bot.mc_player_activity[player] = {'sessions': 0, 'total_time': 0}
+                        bot.mc_player_activity[player]['last_join'] = discord.utils.utcnow()
+                        
+                    current_players.add(player)
+                except:
+                    pass
+            elif 'Player disconnected:' in line:
+                try:
+                    player = line.split('Player disconnected:')[-1].strip().split(',')[0].strip()
+                    if player and player in bot.mc_last_seen_players:
+                        # Player left
+                        embed = discord.Embed(
+                            title="🔴 Player Left",
+                            description=f"**{player}** left the server.",
+                            color=discord.Color.red()
+                        )
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                        bot.mc_last_seen_players.discard(player)
+                        
+                        # Update activity tracking
+                        if player in bot.mc_player_activity and 'last_join' in bot.mc_player_activity[player]:
+                            session_time = (discord.utils.utcnow() - bot.mc_player_activity[player]['last_join']).total_seconds()
+                            bot.mc_player_activity[player]['total_time'] += session_time
+                            bot.mc_player_activity[player]['sessions'] += 1
+                            del bot.mc_player_activity[player]['last_join']
+                    if player in current_players:
+                        current_players.discard(player)
+                except:
+                    pass
+        
+        # Update last seen players
+        bot.mc_last_seen_players = current_players
+        
+    except Exception as e:
+        logger.error(f"Error in player notifications: {e}", exc_info=True)
+
+@minecraft_player_notifications.before_loop
+async def before_player_notifications():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT SCHEDULED BACKUPS
+# =========================================================
+@tasks.loop(hours=1)
+async def minecraft_scheduled_backups():
+    """Perform scheduled backups"""
+    try:
+        for guild_id, backup_config in bot.mc_scheduled_backups.items():
+            if not backup_config.get('enabled', False):
+                continue
+            
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            
+            interval_hours = backup_config.get('interval_hours', 24)
+            last_backup = backup_config.get('last_backup')
+            
+            # Check if it's time for a backup
+            if last_backup:
+                time_since = (discord.utils.utcnow() - last_backup).total_seconds() / 3600
+                if time_since < interval_hours:
+                    continue
+            
+            # Perform backup
+            try:
+                timestamp = discord.utils.utcnow().strftime("%Y%m%d_%H%M%S")
+                backup_name = f"auto_backup_{timestamp}.tar.gz"
+                
+                # Create backup directory if needed
+                mkdir_cmd = "mkdir -p ~/minecraft-backups"
+                await asyncio.create_subprocess_shell(mkdir_cmd)
+                
+                # Create backup
+                backup_cmd = f"cd {MINECRAFT_DIR} && tar -czf ~/minecraft-backups/{backup_name} worlds/"
+                process = await asyncio.create_subprocess_shell(
+                    backup_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+                # Get backup size
+                size_cmd = f"du -h ~/minecraft-backups/{backup_name} | cut -f1"
+                size_process = await asyncio.create_subprocess_shell(
+                    size_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                size_stdout, _ = await size_process.communicate()
+                backup_size = size_stdout.decode().strip()
+                
+                # Update last backup time
+                backup_config['last_backup'] = discord.utils.utcnow()
+                
+                # Send notification
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="💾 Automatic Backup Created",
+                            description=f"World backup completed successfully!",
+                            color=discord.Color.green()
+                        )
+                        embed.add_field(name="Backup Name", value=backup_name, inline=True)
+                        embed.add_field(name="Size", value=backup_size, inline=True)
+                        embed.add_field(name="Location", value="`~/minecraft-backups/`", inline=False)
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                
+                logger.info(f"✅ Scheduled backup created: {backup_name}")
+                
+            except Exception as e:
+                logger.error(f"Error creating scheduled backup: {e}", exc_info=True)
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        await channel.send(f"❌ **Backup Failed**\nError: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error in scheduled backups: {e}", exc_info=True)
+
+@minecraft_scheduled_backups.before_loop
+async def before_scheduled_backups():
     await bot.wait_until_ready()
 
 # -------------------------

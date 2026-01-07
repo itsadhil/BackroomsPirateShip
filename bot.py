@@ -3444,78 +3444,78 @@ async def process_fitgirl_torrent_submission(interaction, user):
                 ephemeral=True
             )
             return
-    
-    # Get public torrent URL and update with button
-    try:
-        # Forum threads have starter_message, not message
-        starter_message = getattr(thread, 'starter_message', None)
-        if not starter_message:
-            # Try to fetch the message if it's not available
-            try:
-                async for message in thread.history(limit=1):
-                    starter_message = message
-                    break
-            except:
-                pass
         
-        if starter_message and hasattr(starter_message, 'attachments') and starter_message.attachments:
-            public_torrent_url = starter_message.attachments[0].url
-            view = GameButtonView(data['game_link'], public_torrent_url)
-            await starter_message.edit(view=view if view.children else None)
-    except Exception as e:
-        logger.warning(f"Could not update starter message with button: {e}", exc_info=True)
-    
-    # Log to input channel
-    try:
-        version_text = f"\n📦 **Version:** {data['version']}" if data.get('version') else ""
-        thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
-        await input_channel.send(
-            f"📥 **New Game Submitted** (Auto from FitGirl)\n"
-            f"👤 **User:** {user.mention}\n"
-            f"🎮 **Game:** {data['game_name']}{version_text}\n"
-            f"🔗 **Link:** {data['game_link'] or 'N/A'}\n"
-            f"⬇️ **Torrent:** Attached\n"
-            f"📦 **Thread:** {thread_mention}"
-        )
-    except Exception as e:
-        logger.error(f"Could not log to input channel: {e}", exc_info=True)
-    
-    # Track contributor
-    try:
-        if user.id not in bot.contributor_stats:
-            bot.contributor_stats[user.id] = 0
-        bot.contributor_stats[user.id] += 1
-        save_bot_state()
-    except Exception as e:
-        logger.error(f"Could not update contributor stats: {e}", exc_info=True)
-    
-    # Update dashboard immediately
-    try:
-        await update_dashboard()
-    except Exception as e:
-        logger.error(f"Could not update dashboard: {e}", exc_info=True)
-    
-    # DM the user
-    try:
-        thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
-        dm_embed = discord.Embed(
-            title="✅ Game Added Successfully!",
-            description=f"**{thread_name}** has been added from FitGirl Repacks!",
-            color=0x00FF00
-        )
-        dm_embed.add_field(
-            name="🔗 View Game Thread",
-            value=thread_mention,
-            inline=False
-        )
-        dm_embed.set_footer(text="FitGirl Auto-Add")
+        # Get public torrent URL and update with button
+        try:
+            # Forum threads have starter_message, not message
+            starter_message = getattr(thread, 'starter_message', None)
+            if not starter_message:
+                # Try to fetch the message if it's not available
+                try:
+                    async for message in thread.history(limit=1):
+                        starter_message = message
+                        break
+                except:
+                    pass
+            
+            if starter_message and hasattr(starter_message, 'attachments') and starter_message.attachments:
+                public_torrent_url = starter_message.attachments[0].url
+                view = GameButtonView(data['game_link'], public_torrent_url)
+                await starter_message.edit(view=view if view.children else None)
+        except Exception as e:
+            logger.warning(f"Could not update starter message with button: {e}", exc_info=True)
         
-        await user.send(embed=dm_embed)
-    except discord.Forbidden:
-        logger.warning(f"Could not DM user {user.name} - DMs disabled")
-    except Exception as e:
-        logger.error(f"Error sending DM: {e}", exc_info=True)
-    
+        # Log to input channel
+        try:
+            version_text = f"\n📦 **Version:** {data['version']}" if data.get('version') else ""
+            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            await input_channel.send(
+                f"📥 **New Game Submitted** (Auto from FitGirl)\n"
+                f"👤 **User:** {user.mention}\n"
+                f"🎮 **Game:** {data['game_name']}{version_text}\n"
+                f"🔗 **Link:** {data['game_link'] or 'N/A'}\n"
+                f"⬇️ **Torrent:** Attached\n"
+                f"📦 **Thread:** {thread_mention}"
+            )
+        except Exception as e:
+            logger.error(f"Could not log to input channel: {e}", exc_info=True)
+        
+        # Track contributor
+        try:
+            if user.id not in bot.contributor_stats:
+                bot.contributor_stats[user.id] = 0
+            bot.contributor_stats[user.id] += 1
+            save_bot_state()
+        except Exception as e:
+            logger.error(f"Could not update contributor stats: {e}", exc_info=True)
+        
+        # Update dashboard immediately
+        try:
+            await update_dashboard()
+        except Exception as e:
+            logger.error(f"Could not update dashboard: {e}", exc_info=True)
+        
+        # DM the user
+        try:
+            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            dm_embed = discord.Embed(
+                title="✅ Game Added Successfully!",
+                description=f"**{thread_name}** has been added from FitGirl Repacks!",
+                color=0x00FF00
+            )
+            dm_embed.add_field(
+                name="🔗 View Game Thread",
+                value=thread_mention,
+                inline=False
+            )
+            dm_embed.set_footer(text="FitGirl Auto-Add")
+            
+            await user.send(embed=dm_embed)
+        except discord.Forbidden:
+            logger.warning(f"Could not DM user {user.name} - DMs disabled")
+        except Exception as e:
+            logger.error(f"Error sending DM: {e}", exc_info=True)
+        
         # Follow up in the interaction
         try:
             thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"

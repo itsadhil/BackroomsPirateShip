@@ -2995,17 +2995,7 @@ class FitGirlSearchView(discord.ui.View):
     @discord.ui.button(label="📥 Download & Add", style=discord.ButtonStyle.success, row=1)
     async def download_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Download torrent and auto-create game submission."""
-        # Check if user has the required role
-        REQUIRED_ROLE_ID = 1072117821397540954
-        has_role = any(role.id == REQUIRED_ROLE_ID for role in interaction.user.roles)
-        
-        if not has_role:
-            await interaction.response.send_message(
-                "❌ You don't have permission to add games.",
-                ephemeral=True,
-                delete_after=30
-            )
-            return
+        # Allow anyone to add games - no permission check needed
         
         await interaction.response.send_message(
             "⏳ Checking if game already exists...",
@@ -3203,8 +3193,7 @@ class FitGirlSearchView(discord.ui.View):
 @bot.tree.command(name="fgsearch", description="Search FitGirl Repacks for a game")
 async def fgsearch(interaction: discord.Interaction, game_name: str):
     """Search FitGirl Repacks website for games."""
-    if not await check_command_permissions(interaction):
-        return
+    # Allow anyone to use fgsearch - no permission check needed
     await interaction.response.defer()
     
     results = await fitgirl_scraper.search_game(game_name)

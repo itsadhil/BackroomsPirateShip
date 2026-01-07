@@ -156,7 +156,8 @@ def load_seen_posts():
 
 def save_seen_posts():
     try:
-        data_manager.seen_rss_posts = bot.seen_rss_posts
+        # Update the internal attribute directly (property is read-only)
+        data_manager._seen_rss_posts = bot.seen_rss_posts.copy()
         data_manager.save_seen_posts()
     except Exception as e:
         logger.error(f"⚠️ Could not save seen posts: {e}", exc_info=True)
@@ -226,7 +227,7 @@ def load_reviews_data():
 def save_reviews_data():
     """Save review data."""
     try:
-        data_manager.reviews = bot.game_reviews
+        data_manager._reviews = bot.game_reviews.copy()
         data_manager.save_reviews()
     except Exception as e:
         logger.error(f"⚠️ Could not save reviews data: {e}", exc_info=True)
@@ -243,7 +244,7 @@ def load_tags_data():
 def save_tags_data():
     """Save tags data."""
     try:
-        data_manager.tags = bot.game_tags
+        data_manager._tags = bot.game_tags.copy()
         data_manager.save_tags()
     except Exception as e:
         logger.error(f"⚠️ Could not save tags data: {e}", exc_info=True)
@@ -260,7 +261,7 @@ def load_health_data():
 def save_health_data():
     """Save link health data."""
     try:
-        data_manager.health = bot.link_health
+        data_manager._health = bot.link_health.copy()
         data_manager.save_health()
     except Exception as e:
         logger.error(f"⚠️ Could not save health data: {e}", exc_info=True)
@@ -277,7 +278,7 @@ def load_webhooks_data():
 def save_webhooks_data():
     """Save webhooks data."""
     try:
-        data_manager.webhooks = bot.webhooks
+        data_manager._webhooks = bot.webhooks.copy()
         data_manager.save_webhooks()
     except Exception as e:
         logger.error(f"⚠️ Could not save webhooks data: {e}", exc_info=True)
@@ -294,7 +295,7 @@ def load_collections_data():
 def save_collections_data():
     """Save collections data."""
     try:
-        data_manager.collections = bot.collections
+        data_manager._collections = bot.collections.copy()
         data_manager.save_collections()
     except Exception as e:
         logger.error(f"⚠️ Could not save collections data: {e}", exc_info=True)
@@ -311,7 +312,7 @@ def load_compatibility_data():
 def save_compatibility_data():
     """Save compatibility data."""
     try:
-        data_manager.compatibility = bot.compatibility_reports
+        data_manager._compatibility = bot.compatibility_reports.copy()
         data_manager.save_compatibility()
     except Exception as e:
         logger.error(f"⚠️ Could not save compatibility data: {e}", exc_info=True)

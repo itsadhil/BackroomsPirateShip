@@ -9563,127 +9563,90 @@ async def minecraft_player_notifications():
                 continue
                 
             line_lower = line.lower()
-            # Remove systemd timestamp prefixes if present
-            if ']' in line and line[0] == '[':
+            # Remove systemd/journalctl prefixes if present
+            # Format from journalctl -o cat: "[2026-01-07 17:26:10:720 INFO] Player connected: AdhilQuazi2866, xuid: ..."
+            if line.startswith('[') and ']' in line:
+                # Extract part after timestamp: "[2026-01-07 17:26:10:720 INFO] Player connected: ..."
                 line = line.split(']', 1)[-1].strip()
                 line_lower = line.lower()
             
-            # Check for various player join patterns (Bedrock server formats)
-            if any(keyword in line_lower for keyword in ['player connected', 'player joined', 'joined the game', 'connected:']):
+            # Check for player connected (exact Bedrock format: "Player connected: PlayerName, xuid: ...")
+            if 'player connected:' in line_lower:
                 try:
-                    # Try to extract player name from various log formats
-                    player = None
-                    
-                    # Format 1: "Player connected: PlayerName"
-                    if 'player connected:' in line_lower:
-                        parts = line.split('Player connected:', 1) if 'Player connected:' in line else line.split('player connected:', 1)
-                        if len(parts) > 1:
-                            player = parts[-1].strip().split(',')[0].strip().split()[0].strip()
-                    
-                    # Format 2: "PlayerName connected"
-                    elif ' connected' in line_lower and 'player' in line_lower:
-                        # Try to find player name before "connected"
-                        parts = line_lower.split('connected')
-                        if len(parts) > 0:
-                            # Get last word before "connected"
-                            before = parts[0].strip().split()
-                            if before:
-                                player = before[-1].strip()
-                    
-                    # Format 3: "PlayerName joined the game"
-                    elif 'joined the game' in line_lower or 'joined' in line_lower:
-                        parts = line_lower.split('joined')
-                        if len(parts) > 0:
-                            before = parts[0].strip().split()
-                            if before:
-                                player = before[-1].strip()
-                    
-                    # Format 4: "PlayerName connected to server"
-                    elif 'connected to' in line_lower:
-                        parts = line_lower.split('connected to')
-                        if len(parts) > 0:
-                            before = parts[0].strip().split()
-                            if before:
-                                player = before[-1].strip()
-                    
-                    # Clean up player name (remove brackets, quotes, etc.)
-                    if player:
+                    # Format: "Player connected: AdhilQuazi2866, xuid: 2535424834170267"
+                    parts = line.split('Player connected:', 1) if 'Player connected:' in line else line.split('player connected:', 1)
+                    if len(parts) > 1:
+                        # Get player name (before comma or before "xuid")
+                        player_part = parts[-1].strip()
+                        # Remove xuid part if present
+                        if ',' in player_part:
+                            player = player_part.split(',')[0].strip()
+                        elif 'xuid' in player_part.lower():
+                            player = player_part.split('xuid')[0].strip()
+                        else:
+                            player = player_part.split()[0].strip()
+                        
+                        # Clean up
                         player = player.strip('[]()"\'').strip()
-                        # Skip if it's not a valid player name (too short, contains special chars that indicate it's not a name)
-                        if len(player) < 2 or player.lower() in ['server', 'the', 'a', 'an']:
-                            player = None
-                    
-                    if player and player not in bot.mc_last_seen_players:
-                        # New player joined
-                        embed = discord.Embed(
-                            title="🟢 Player Joined",
-                            description=f"**{player}** joined the server!",
-                            color=discord.Color.green()
-                        )
-                        embed.timestamp = discord.utils.utcnow()
-                        await channel.send(embed=embed)
-                        bot.mc_last_seen_players.add(player)
                         
-                        # Track activity
-                        if player not in bot.mc_player_activity:
-                            bot.mc_player_activity[player] = {'sessions': 0, 'total_time': 0}
-                        bot.mc_player_activity[player]['last_join'] = discord.utils.utcnow()
+                        if player and len(player) >= 2 and player not in bot.mc_last_seen_players:
+                            # New player joined
+                            embed = discord.Embed(
+                                title="🟢 Player Joined",
+                                description=f"**{player}** joined the server!",
+                                color=discord.Color.green()
+                            )
+                            embed.timestamp = discord.utils.utcnow()
+                            await channel.send(embed=embed)
+                            bot.mc_last_seen_players.add(player)
+                            
+                            # Track activity
+                            if player not in bot.mc_player_activity:
+                                bot.mc_player_activity[player] = {'sessions': 0, 'total_time': 0}
+                            bot.mc_player_activity[player]['last_join'] = discord.utils.utcnow()
                         
-                    current_players.add(player)
+                        if player:
+                            current_players.add(player)
                 except:
                     pass
-            elif any(keyword in line_lower for keyword in ['player disconnected', 'player left', 'left the game', 'disconnected:']):
+            # Check for player disconnected (Bedrock format)
+            elif 'player disconnected:' in line_lower:
                 try:
-                    # Try to extract player name from various log formats
-                    player = None
-                    
-                    # Format 1: "Player disconnected: PlayerName"
-                    if 'player disconnected:' in line_lower:
-                        parts = line.split('Player disconnected:', 1) if 'Player disconnected:' in line else line.split('player disconnected:', 1)
-                        if len(parts) > 1:
-                            player = parts[-1].strip().split(',')[0].strip().split()[0].strip()
-                    
-                    # Format 2: "PlayerName disconnected"
-                    elif ' disconnected' in line_lower and 'player' in line_lower:
-                        parts = line_lower.split('disconnected')
-                        if len(parts) > 0:
-                            before = parts[0].strip().split()
-                            if before:
-                                player = before[-1].strip()
-                    
-                    # Format 3: "PlayerName left the game"
-                    elif 'left the game' in line_lower or ('left' in line_lower and 'player' in line_lower):
-                        parts = line_lower.split('left')
-                        if len(parts) > 0:
-                            before = parts[0].strip().split()
-                            if before:
-                                player = before[-1].strip()
-                    
-                    # Clean up player name
-                    if player:
-                        player = player.strip('[]()"\'').strip()
-                        if len(player) < 2 or player.lower() in ['server', 'the', 'a', 'an']:
-                            player = None
-                    
-                    if player and player in bot.mc_last_seen_players:
-                        # Player left
-                        embed = discord.Embed(
-                            title="🔴 Player Left",
-                            description=f"**{player}** left the server.",
-                            color=discord.Color.red()
-                        )
-                        embed.timestamp = discord.utils.utcnow()
-                        await channel.send(embed=embed)
-                        bot.mc_last_seen_players.discard(player)
+                    # Format: "Player disconnected: PlayerName, xuid: ..."
+                    parts = line.split('Player disconnected:', 1) if 'Player disconnected:' in line else line.split('player disconnected:', 1)
+                    if len(parts) > 1:
+                        # Get player name (before comma or before "xuid")
+                        player_part = parts[-1].strip()
+                        if ',' in player_part:
+                            player = player_part.split(',')[0].strip()
+                        elif 'xuid' in player_part.lower():
+                            player = player_part.split('xuid')[0].strip()
+                        else:
+                            player = player_part.split()[0].strip()
                         
-                        # Update activity tracking
-                        if player in bot.mc_player_activity and 'last_join' in bot.mc_player_activity[player]:
-                            session_time = (discord.utils.utcnow() - bot.mc_player_activity[player]['last_join']).total_seconds()
-                            bot.mc_player_activity[player]['total_time'] += session_time
-                            bot.mc_player_activity[player]['sessions'] += 1
-                            del bot.mc_player_activity[player]['last_join']
-                    if player in current_players:
-                        current_players.discard(player)
+                        # Clean up
+                        player = player.strip('[]()"\'').strip()
+                        
+                        if player and len(player) >= 2 and player in bot.mc_last_seen_players:
+                            # Player left
+                            embed = discord.Embed(
+                                title="🔴 Player Left",
+                                description=f"**{player}** left the server.",
+                                color=discord.Color.red()
+                            )
+                            embed.timestamp = discord.utils.utcnow()
+                            await channel.send(embed=embed)
+                            bot.mc_last_seen_players.discard(player)
+                            
+                            # Update activity tracking
+                            if player in bot.mc_player_activity and 'last_join' in bot.mc_player_activity[player]:
+                                session_time = (discord.utils.utcnow() - bot.mc_player_activity[player]['last_join']).total_seconds()
+                                bot.mc_player_activity[player]['total_time'] += session_time
+                                bot.mc_player_activity[player]['sessions'] += 1
+                                del bot.mc_player_activity[player]['last_join']
+                        
+                        if player and player in current_players:
+                            current_players.discard(player)
                 except:
                     pass
         

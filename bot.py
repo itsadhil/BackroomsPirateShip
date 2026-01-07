@@ -8396,10 +8396,13 @@ async def mcnotify(interaction: discord.Interaction, channel: discord.TextChanne
                 description=f"Player join/leave notifications will be sent to {channel.mention}",
                 color=discord.Color.green()
             )
+            embed.add_field(name="Status", value=f"Task running: {minecraft_player_notifications.is_running()}", inline=False)
+            embed.add_field(name="Server Status", value="🟢 Running" if await is_minecraft_running() else "🔴 Offline", inline=False)
             
             # Start notification task if not running
             if not minecraft_player_notifications.is_running():
                 minecraft_player_notifications.start()
+                embed.add_field(name="Note", value="Notification task has been started", inline=False)
             
             await interaction.followup.send(embed=embed)
         else:
@@ -8413,6 +8416,7 @@ async def mcnotify(interaction: discord.Interaction, channel: discord.TextChanne
         
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
+        logger.error(f"Error in mcnotify: {e}", exc_info=True)
 
 @bot.tree.command(name="mcautorestart", description="Enable/disable auto-restart on crash (Admin only)")
 @discord.app_commands.describe(enabled="Enable auto-restart")
@@ -9211,6 +9215,61 @@ async def mcalias(interaction: discord.Interaction, alias: str, command: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
+@bot.tree.command(name="mctestlogs", description="Test player log detection (Admin only)")
+async def mctestlogs(interaction: discord.Interaction):
+    """Test what player logs are being detected"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Get recent logs
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '2 minutes ago' --no-pager -o cat 2>/dev/null"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        all_logs = logs_stdout.decode()
+        
+        # Filter for player-related logs
+        player_logs = [l for l in all_logs.split('\n') if any(kw in l.lower() for kw in ['player', 'connected', 'disconnected', 'joined', 'left'])]
+        
+        embed = discord.Embed(
+            title="🔍 Log Test Results",
+            color=discord.Color.blue()
+        )
+        
+        if player_logs:
+            # Show last 10 player-related log lines
+            recent_logs = player_logs[-10:]
+            embed.add_field(
+                name="Recent Player Logs",
+                value=f"```\n" + "\n".join(recent_logs) + "\n```",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="No Player Logs Found",
+                value="No player-related logs found in the last 2 minutes.",
+                inline=False
+            )
+        
+        embed.add_field(name="Notification Channel", value=f"<#{bot.mc_notification_channel}>" if bot.mc_notification_channel else "Not set", inline=True)
+        embed.add_field(name="Task Running", value="Yes" if minecraft_player_notifications.is_running() else "No", inline=True)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+        logger.error(f"Error in mctestlogs: {e}", exc_info=True)
+
 @bot.tree.command(name="mcconsole", description="Start/stop live console streaming (Admin only)")
 async def mcconsole(interaction: discord.Interaction, action: str):
     """Toggle live console streaming"""
@@ -9460,11 +9519,11 @@ async def minecraft_player_notifications():
             bot.mc_last_seen_players = set()
         
         # Get current online players from logs
-        # Try multiple sources: systemd logs, screen logs, and direct server logs
+        # Try multiple sources: systemd logs and direct server logs
         logs = ""
         
-        # Method 1: Try systemd logs
-        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
+        # Method 1: Try systemd logs (primary method)
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '30 seconds ago' --no-pager -o cat 2>/dev/null | grep -iE 'player.*connected|player.*disconnected|player.*joined|player.*left|connected.*player|disconnected.*player'"
         process = await asyncio.create_subprocess_shell(
             logs_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -9473,53 +9532,86 @@ async def minecraft_player_notifications():
         logs_stdout, _ = await process.communicate()
         logs = logs_stdout.decode()
         
-        # Method 2: If no systemd logs, try screen session logs
+        # Method 2: Try server log files directly (Bedrock logs)
         if not logs or len(logs.strip()) == 0:
-            screen_log = "/tmp/mc_console_stream.log"
-            dump_cmd = f"screen -S minecraft -X hardcopy -h {screen_log} 2>/dev/null && tail -n 100 {screen_log} 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
-            screen_process = await asyncio.create_subprocess_shell(
-                dump_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            screen_stdout, _ = await screen_process.communicate()
-            screen_logs = screen_stdout.decode()
-            if screen_logs:
-                logs = screen_logs
-        
-        # Method 3: Try server log files directly
-        if not logs or len(logs.strip()) == 0:
-            log_file_cmd = f"tail -n 100 {MINECRAFT_DIR}/logs/*.log 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
-            log_process = await asyncio.create_subprocess_shell(
+            # Check for latest log file
+            log_file_cmd = f"ls -t {MINECRAFT_DIR}/logs/*.log 2>/dev/null | head -1"
+            log_file_process = await asyncio.create_subprocess_shell(
                 log_file_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            log_stdout, _ = await log_process.communicate()
-            log_output = log_stdout.decode()
-            if log_output:
-                logs = log_output
+            log_file_stdout, _ = await log_file_process.communicate()
+            latest_log = log_file_stdout.decode().strip()
+            
+            if latest_log:
+                # Read last 200 lines and search for player events
+                tail_cmd = f"tail -n 200 {latest_log} 2>/dev/null | grep -iE 'player.*connected|player.*disconnected|player.*joined|player.*left|connected.*player|disconnected.*player'"
+                log_process = await asyncio.create_subprocess_shell(
+                    tail_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                log_stdout, _ = await log_process.communicate()
+                log_output = log_stdout.decode()
+                if log_output:
+                    logs = log_output
         
         current_players = set()
         for line in logs.split('\n'):
+            if not line.strip():
+                continue
+                
             line_lower = line.lower()
-            # Check for various player join patterns
-            if 'player connected:' in line_lower or 'player joined' in line_lower or 'joined the game' in line_lower:
+            # Remove systemd timestamp prefixes if present
+            if ']' in line and line[0] == '[':
+                line = line.split(']', 1)[-1].strip()
+                line_lower = line.lower()
+            
+            # Check for various player join patterns (Bedrock server formats)
+            if any(keyword in line_lower for keyword in ['player connected', 'player joined', 'joined the game', 'connected:']):
                 try:
                     # Try to extract player name from various log formats
                     player = None
-                    if 'Player connected:' in line:
-                        player = line.split('Player connected:')[-1].strip().split(',')[0].strip()
-                    elif 'Player joined' in line:
-                        # Format: "Player joined: PlayerName"
-                        parts = line.split('Player joined')
+                    
+                    # Format 1: "Player connected: PlayerName"
+                    if 'player connected:' in line_lower:
+                        parts = line.split('Player connected:', 1) if 'Player connected:' in line else line.split('player connected:', 1)
                         if len(parts) > 1:
-                            player = parts[-1].strip().split()[0].strip()
-                    elif 'joined the game' in line:
-                        # Format: "PlayerName joined the game"
-                        parts = line.split('joined the game')
+                            player = parts[-1].strip().split(',')[0].strip().split()[0].strip()
+                    
+                    # Format 2: "PlayerName connected"
+                    elif ' connected' in line_lower and 'player' in line_lower:
+                        # Try to find player name before "connected"
+                        parts = line_lower.split('connected')
                         if len(parts) > 0:
-                            player = parts[0].strip().split()[-1].strip()
+                            # Get last word before "connected"
+                            before = parts[0].strip().split()
+                            if before:
+                                player = before[-1].strip()
+                    
+                    # Format 3: "PlayerName joined the game"
+                    elif 'joined the game' in line_lower or 'joined' in line_lower:
+                        parts = line_lower.split('joined')
+                        if len(parts) > 0:
+                            before = parts[0].strip().split()
+                            if before:
+                                player = before[-1].strip()
+                    
+                    # Format 4: "PlayerName connected to server"
+                    elif 'connected to' in line_lower:
+                        parts = line_lower.split('connected to')
+                        if len(parts) > 0:
+                            before = parts[0].strip().split()
+                            if before:
+                                player = before[-1].strip()
+                    
+                    # Clean up player name (remove brackets, quotes, etc.)
+                    if player:
+                        player = player.strip('[]()"\'').strip()
+                        # Skip if it's not a valid player name (too short, contains special chars that indicate it's not a name)
+                        if len(player) < 2 or player.lower() in ['server', 'the', 'a', 'an']:
+                            player = None
                     
                     if player and player not in bot.mc_last_seen_players:
                         # New player joined
@@ -9540,22 +9632,38 @@ async def minecraft_player_notifications():
                     current_players.add(player)
                 except:
                     pass
-            elif 'Player disconnected:' in line_lower or 'player left' in line_lower or 'left the game' in line_lower:
+            elif any(keyword in line_lower for keyword in ['player disconnected', 'player left', 'left the game', 'disconnected:']):
                 try:
                     # Try to extract player name from various log formats
                     player = None
-                    if 'Player disconnected:' in line:
-                        player = line.split('Player disconnected:')[-1].strip().split(',')[0].strip()
-                    elif 'Player left' in line:
-                        # Format: "Player left: PlayerName"
-                        parts = line.split('Player left')
+                    
+                    # Format 1: "Player disconnected: PlayerName"
+                    if 'player disconnected:' in line_lower:
+                        parts = line.split('Player disconnected:', 1) if 'Player disconnected:' in line else line.split('player disconnected:', 1)
                         if len(parts) > 1:
-                            player = parts[-1].strip().split()[0].strip()
-                    elif 'left the game' in line:
-                        # Format: "PlayerName left the game"
-                        parts = line.split('left the game')
+                            player = parts[-1].strip().split(',')[0].strip().split()[0].strip()
+                    
+                    # Format 2: "PlayerName disconnected"
+                    elif ' disconnected' in line_lower and 'player' in line_lower:
+                        parts = line_lower.split('disconnected')
                         if len(parts) > 0:
-                            player = parts[0].strip().split()[-1].strip()
+                            before = parts[0].strip().split()
+                            if before:
+                                player = before[-1].strip()
+                    
+                    # Format 3: "PlayerName left the game"
+                    elif 'left the game' in line_lower or ('left' in line_lower and 'player' in line_lower):
+                        parts = line_lower.split('left')
+                        if len(parts) > 0:
+                            before = parts[0].strip().split()
+                            if before:
+                                player = before[-1].strip()
+                    
+                    # Clean up player name
+                    if player:
+                        player = player.strip('[]()"\'').strip()
+                        if len(player) < 2 or player.lower() in ['server', 'the', 'a', 'an']:
+                            player = None
                     
                     if player and player in bot.mc_last_seen_players:
                         # Player left
@@ -9584,6 +9692,21 @@ async def minecraft_player_notifications():
         
     except Exception as e:
         logger.error(f"Error in player notifications: {e}", exc_info=True)
+        # Log the error but don't crash the task
+        if bot.mc_notification_channel:
+            try:
+                error_channel = bot.get_channel(bot.mc_notification_channel)
+                if error_channel:
+                    # Only send error once per hour to avoid spam
+                    if not hasattr(bot, 'mc_last_error_time'):
+                        bot.mc_last_error_time = {}
+                    now = discord.utils.utcnow()
+                    last_error = bot.mc_last_error_time.get('notifications')
+                    if not last_error or (now - last_error).total_seconds() > 3600:
+                        await error_channel.send(f"⚠️ Player notification error: {str(e)[:200]}")
+                        bot.mc_last_error_time['notifications'] = now
+            except:
+                pass
 
 @minecraft_player_notifications.before_loop
 async def before_player_notifications():

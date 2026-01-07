@@ -3340,95 +3340,95 @@ async def process_fitgirl_torrent_submission(interaction, user):
             igdb_data = await rawg_client.search_game_by_name(clean_name)
             if igdb_data:
                 logger.info(f"✅ RAWG found data for: {clean_name}")
-    
-    # BUILD EMBED WITH IGDB DATA
-    if igdb_data:
-        game_title = igdb_data.get("name", data['game_name'])
-        summary = igdb_data.get("summary", data['notes'] or "No description available.")
         
-        genres = igdb_data.get("genres", [])
-        genres_text = " • ".join([g["name"] for g in genres]) if genres else "N/A"
-        
-        platforms = igdb_data.get("platforms", [])
-        platforms_text = " • ".join([p["name"] for p in platforms]) if platforms else "N/A"
-        
-        cover_url = None
-        if "cover" in igdb_data and igdb_data["cover"]:
-            image_id = igdb_data["cover"].get("image_id")
-            if image_id and isinstance(image_id, str) and len(image_id) > 0:
-                if image_id.startswith("http"):
-                    cover_url = image_id
-                else:
-                    cover_url = f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg"
-        
-        embed = discord.Embed(
-            title=game_title,
-            description=summary[:600] + ("..." if len(summary) > 600 else ""),
-            color=0x1b2838
-        )
-        
-        if cover_url:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.head(cover_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            embed.set_image(url=cover_url)
-            except Exception as e:
-                print(f"⚠️ Could not verify image: {e}")
-                embed.set_image(url=cover_url)
-        
-        embed.add_field(name="🎮 Genres", value=genres_text, inline=True)
-        embed.add_field(name="🖥️ Platforms", value=platforms_text, inline=True)
-        
-        if data.get('version'):
-            embed.add_field(name="📦 Version", value=data['version'], inline=True)
-        
-        if data['notes']:
+        # BUILD EMBED WITH IGDB DATA
+        if igdb_data:
+            game_title = igdb_data.get("name", data['game_name'])
+            summary = igdb_data.get("summary", data['notes'] or "No description available.")
+            
+            genres = igdb_data.get("genres", [])
+            genres_text = " • ".join([g["name"] for g in genres]) if genres else "N/A"
+            
+            platforms = igdb_data.get("platforms", [])
+            platforms_text = " • ".join([p["name"] for p in platforms]) if platforms else "N/A"
+            
+            cover_url = None
+            if "cover" in igdb_data and igdb_data["cover"]:
+                image_id = igdb_data["cover"].get("image_id")
+                if image_id and isinstance(image_id, str) and len(image_id) > 0:
+                    if image_id.startswith("http"):
+                        cover_url = image_id
+                    else:
+                        cover_url = f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg"
+            
+            embed = discord.Embed(
+                title=game_title,
+                description=summary[:600] + ("..." if len(summary) > 600 else ""),
+                color=0x1b2838
+            )
+            
+            if cover_url:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.head(cover_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                embed.set_image(url=cover_url)
+                except Exception as e:
+                    logger.warning(f"Could not verify image: {e}")
+                    embed.set_image(url=cover_url)
+            
+            embed.add_field(name="🎮 Genres", value=genres_text, inline=True)
+            embed.add_field(name="🖥️ Platforms", value=platforms_text, inline=True)
+            
+            if data.get('version'):
+                embed.add_field(name="📦 Version", value=data['version'], inline=True)
+            
+            if data['notes']:
+                embed.add_field(
+                    name="📝 FitGirl Repack Info",
+                    value=data['notes'][:400] + ("..." if len(data['notes']) > 400 else ""),
+                    inline=False
+                )
+            
+            embed.set_footer(
+                text=f"Added by {user.name} • From FitGirl Repacks",
+                icon_url=user.display_avatar.url
+            )
+            embed.timestamp = discord.utils.utcnow()
+        else:
+            embed = discord.Embed(
+                title=data['game_name'],
+                description=data['notes'] or "No description provided.",
+                color=0x1b2838
+            )
             embed.add_field(
-                name="📝 FitGirl Repack Info",
-                value=data['notes'][:400] + ("..." if len(data['notes']) > 400 else ""),
+                name="⚠️ Note",
+                value="Game data not found in IGDB database",
                 inline=False
             )
+            embed.set_footer(
+                text=f"Added by {user.name} • From FitGirl Repacks",
+                icon_url=user.display_avatar.url
+            )
+            embed.timestamp = discord.utils.utcnow()
         
-        embed.set_footer(
-            text=f"Added by {user.name} • From FitGirl Repacks",
-            icon_url=user.display_avatar.url
+        # Create torrent file object
+        torrent_filename = f"{data['game_name'][:50]} [FitGirl Repack].torrent"
+        torrent_filename = re.sub(r'[<>:"/\\|?*]', '', torrent_filename)  # Clean filename
+        
+        public_torrent_file = discord.File(
+            fp=io.BytesIO(torrent_data),
+            filename=f"SPOILER_{torrent_filename}",
+            spoiler=True
         )
-        embed.timestamp = discord.utils.utcnow()
-    else:
-        embed = discord.Embed(
-            title=data['game_name'],
-            description=data['notes'] or "No description provided.",
-            color=0x1b2838
-        )
-        embed.add_field(
-            name="⚠️ Note",
-            value="Game data not found in IGDB database",
-            inline=False
-        )
-        embed.set_footer(
-            text=f"Added by {user.name} • From FitGirl Repacks",
-            icon_url=user.display_avatar.url
-        )
-        embed.timestamp = discord.utils.utcnow()
-    
-    # Create torrent file object
-    torrent_filename = f"{data['game_name'][:50]} [FitGirl Repack].torrent"
-    torrent_filename = re.sub(r'[<>:"/\\|?*]', '', torrent_filename)  # Clean filename
-    
-    public_torrent_file = discord.File(
-        fp=io.BytesIO(torrent_data),
-        filename=f"SPOILER_{torrent_filename}",
-        spoiler=True
-    )
-    
-    thread_name = igdb_data.get("name", data['game_name']) if igdb_data else data['game_name']
-    thread_name = thread_name[:100]
-    
-    view = GameButtonView(data['game_link'], None)
-    
-    # Create thread in forum channel
-    try:
+        
+        thread_name = igdb_data.get("name", data['game_name']) if igdb_data else data['game_name']
+        thread_name = thread_name[:100]
+        
+        view = GameButtonView(data['game_link'], None)
+        
+        # Create thread in forum channel
+        try:
         thread = await output_channel.create_thread(
             name=thread_name,
             content=f"**{thread_name}**",
@@ -3516,16 +3516,27 @@ async def process_fitgirl_torrent_submission(interaction, user):
     except Exception as e:
         logger.error(f"Error sending DM: {e}", exc_info=True)
     
-    # Follow up in the interaction
-    try:
-        thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
-        await interaction.followup.send(
-            f"✅ **{thread_name}** has been added to {thread_mention}!\n"
-            f"📬 Check your DMs for details!",
-            ephemeral=True
-        )
+        # Follow up in the interaction
+        try:
+            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            await interaction.followup.send(
+                f"✅ **{thread_name}** has been added to {thread_mention}!\n"
+                f"📬 Check your DMs for details!",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error sending followup: {e}", exc_info=True)
+    
     except Exception as e:
-        logger.error(f"Error sending followup: {e}", exc_info=True)
+        logger.error(f"Error in process_fitgirl_torrent_submission: {e}", exc_info=True)
+        try:
+            await interaction.followup.send(
+                f"❌ Error creating forum thread: {str(e)}\n"
+                f"Please check the logs for details.",
+                ephemeral=True
+            )
+        except:
+            pass
 
 # =========================================================
 # REFRESH DASHBOARD COMMAND

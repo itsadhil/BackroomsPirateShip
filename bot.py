@@ -1319,6 +1319,21 @@ async def on_ready():
         minecraft_scheduled_backups.start()
         print(f"✅ Minecraft scheduled backups monitor started")
     
+    # Start Minecraft scheduled restarts
+    if not minecraft_scheduled_restarts.is_running():
+        minecraft_scheduled_restarts.start()
+        print(f"✅ Minecraft scheduled restarts monitor started")
+    
+    # Start Minecraft resource monitor
+    if not minecraft_resource_monitor.is_running():
+        minecraft_resource_monitor.start()
+        print(f"✅ Minecraft resource monitor started")
+    
+    # Start Minecraft dashboard updater
+    if not minecraft_dashboard_updater.is_running():
+        minecraft_dashboard_updater.start()
+        print(f"✅ Minecraft dashboard updater started")
+    
     # LAST: Update status to online after everything is loaded
     await update_status_message("online")
 
@@ -7396,6 +7411,12 @@ bot.mc_scheduled_backups = {}  # {guild_id: {enabled: bool, interval_hours: int,
 bot.mc_scheduled_restarts = {}  # {guild_id: {enabled: bool, time: str, days: list}}
 bot.mc_player_activity = {}  # Track player sessions and playtime
 bot.mc_last_restart_check = None  # Track last restart check time
+bot.mc_server_rules = {}  # {guild_id: [rules]}
+bot.mc_server_motd = {}  # {guild_id: motd_string}
+bot.mc_command_aliases = {}  # {guild_id: {alias: command}}
+bot.mc_resource_alerts = {}  # {guild_id: {enabled: bool, cpu_threshold: int, mem_threshold: int}}
+bot.mc_dashboard_channel = None  # Channel for performance dashboard
+bot.mc_dashboard_message_id = None  # Message ID for dashboard
 
 async def is_minecraft_running():
     """Check if Minecraft server is running (systemd or screen)"""
@@ -8570,6 +8591,611 @@ async def botstats(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
+# =========================================================
+# MINECRAFT SCHEDULED RESTARTS COMMANDS
+# =========================================================
+@bot.tree.command(name="mcschedule", description="Schedule automatic server restarts (Admin only)")
+@discord.app_commands.describe(enabled="Enable scheduled restarts", time="Time in HH:MM format (24h)", days="Comma-separated days (monday,tuesday,etc)")
+async def mcschedule(interaction: discord.Interaction, enabled: bool, time: str = "03:00", days: str = "monday,tuesday,wednesday,thursday,friday,saturday,sunday"):
+    """Configure scheduled restarts"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            # Validate time format
+            try:
+                from datetime import datetime
+                datetime.strptime(time, "%H:%M")
+            except ValueError:
+                await interaction.followup.send("❌ Invalid time format! Use HH:MM (e.g., 03:00)")
+                return
+            
+            # Parse days
+            day_list = [d.strip().lower() for d in days.split(',')]
+            valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            day_list = [d for d in day_list if d in valid_days]
+            
+            if not day_list:
+                await interaction.followup.send("❌ Invalid days! Use: monday, tuesday, wednesday, thursday, friday, saturday, sunday")
+                return
+            
+            if guild_id not in bot.mc_scheduled_restarts:
+                bot.mc_scheduled_restarts[guild_id] = {}
+            
+            bot.mc_scheduled_restarts[guild_id]['enabled'] = True
+            bot.mc_scheduled_restarts[guild_id]['time'] = time
+            bot.mc_scheduled_restarts[guild_id]['days'] = day_list
+            
+            embed = discord.Embed(
+                title="✅ Scheduled Restarts Enabled",
+                description=f"Server will restart at **{time}** on: {', '.join(day_list)}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Warning", value="Players will be warned 5 minutes before restart", inline=False)
+            
+            if not minecraft_scheduled_restarts.is_running():
+                minecraft_scheduled_restarts.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_scheduled_restarts:
+                bot.mc_scheduled_restarts[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Scheduled Restarts Disabled",
+                description="Scheduled restarts have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT SERVER ANNOUNCEMENTS
+# =========================================================
+@bot.tree.command(name="mcannounce", description="Broadcast message to all players (Admin only)")
+@discord.app_commands.describe(message="Message to broadcast")
+async def mcannounce(interaction: discord.Interaction, message: str):
+    """Broadcast message to all players"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"say {message}\n")
+        except Exception as e:
+            logger.warning(f"Could not write announce command: {e}")
+        
+        embed = discord.Embed(
+            title="📢 Announcement Sent",
+            description=f"**{message}**",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Sent by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcsetmotd", description="Set server MOTD (Message of the Day) (Admin only)")
+@discord.app_commands.describe(motd="MOTD message")
+async def mcsetmotd(interaction: discord.Interaction, motd: str):
+    """Set server MOTD"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        bot.mc_server_motd[guild_id] = motd
+        
+        # Update server.properties
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        update_cmd = f"sed -i 's/^server-name=.*/server-name={motd}/' {config_file}"
+        process = await asyncio.create_subprocess_shell(
+            update_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="✅ MOTD Updated",
+            description=f"Server MOTD set to: **{motd}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Note", value="Restart server for changes to take effect", inline=False)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT GAME MODE & DIFFICULTY
+# =========================================================
+@bot.tree.command(name="mcdifficulty", description="Set server difficulty (Admin only)")
+@discord.app_commands.describe(difficulty="Difficulty level", choices=["easy", "normal", "hard", "peaceful"])
+async def mcdifficulty(interaction: discord.Interaction, difficulty: str):
+    """Set server difficulty"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"difficulty {difficulty}\n")
+        except Exception as e:
+            logger.warning(f"Could not write difficulty command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Difficulty Changed",
+            description=f"Server difficulty set to **{difficulty}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcgamemode", description="Set game mode for a player (Admin only)")
+@discord.app_commands.describe(player="Player username", gamemode="Game mode")
+async def mcgamemode(interaction: discord.Interaction, player: str, gamemode: str):
+    """Set game mode for player"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_modes = ['survival', 'creative', 'adventure', 'spectator']
+        if gamemode.lower() not in valid_modes:
+            await interaction.followup.send(f"❌ Invalid game mode! Use: {', '.join(valid_modes)}")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"gamemode {gamemode.lower()} {player}\n")
+        except Exception as e:
+            logger.warning(f"Could not write gamemode command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Game Mode Changed",
+            description=f"**{player}** game mode set to **{gamemode}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mctime", description="Set or change server time (Admin only)")
+@discord.app_commands.describe(action="Time action")
+async def mctime(interaction: discord.Interaction, action: str):
+    """Set server time"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_actions = ['day', 'night', 'noon', 'midnight']
+        time_value = action.lower()
+        
+        if time_value == 'day':
+            time_value = '1000'
+        elif time_value == 'night':
+            time_value = '13000'
+        elif time_value == 'noon':
+            time_value = '6000'
+        elif time_value == 'midnight':
+            time_value = '18000'
+        else:
+            # Try to parse as number
+            try:
+                int(time_value)
+            except ValueError:
+                await interaction.followup.send(f"❌ Invalid time! Use: day, night, noon, midnight, or a number (0-24000)")
+                return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"time set {time_value}\n")
+        except Exception as e:
+            logger.warning(f"Could not write time command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Time Changed",
+            description=f"Server time set to **{action}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcweather", description="Set server weather (Admin only)")
+@discord.app_commands.describe(weather="Weather type")
+async def mcweather(interaction: discord.Interaction, weather: str):
+    """Set server weather"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_weather = ['clear', 'rain', 'thunder']
+        if weather.lower() not in valid_weather:
+            await interaction.followup.send(f"❌ Invalid weather! Use: {', '.join(valid_weather)}")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"weather {weather.lower()}\n")
+        except Exception as e:
+            logger.warning(f"Could not write weather command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Weather Changed",
+            description=f"Server weather set to **{weather}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT WORLD MANAGEMENT
+# =========================================================
+@bot.tree.command(name="mcworlds", description="List available worlds")
+async def mcworlds(interaction: discord.Interaction):
+    """List available worlds"""
+    await interaction.response.defer()
+    
+    try:
+        worlds_dir = f"{MINECRAFT_DIR}/worlds"
+        list_cmd = f"ls -d {worlds_dir}/*/ 2>/dev/null | xargs -n1 basename"
+        process = await asyncio.create_subprocess_shell(
+            list_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        worlds = [w.strip() for w in stdout.decode().strip().split('\n') if w.strip()]
+        
+        if worlds:
+            embed = discord.Embed(
+                title="🌍 Available Worlds",
+                description="\n".join([f"• {w}" for w in worlds]),
+                color=discord.Color.blue()
+            )
+        else:
+            embed = discord.Embed(
+                title="🌍 Available Worlds",
+                description="No worlds found",
+                color=discord.Color.orange()
+            )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcworldinfo", description="View current world information")
+async def mcworldinfo(interaction: discord.Interaction):
+    """View world information"""
+    await interaction.response.defer()
+    
+    try:
+        # Get world seed from server.properties
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        seed_cmd = f"grep 'level-seed=' {config_file} | cut -d'=' -f2"
+        process = await asyncio.create_subprocess_shell(
+            seed_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        seed = stdout.decode().strip() or "Random"
+        
+        # Get world size
+        worlds_dir = f"{MINECRAFT_DIR}/worlds"
+        size_cmd = f"du -sh {worlds_dir}/*/ 2>/dev/null | head -1 | awk '{{print $1}}'"
+        size_process = await asyncio.create_subprocess_shell(
+            size_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        size_stdout, _ = await size_process.communicate()
+        world_size = size_stdout.decode().strip() or "Unknown"
+        
+        embed = discord.Embed(
+            title="🌍 World Information",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Seed", value=f"`{seed}`", inline=True)
+        embed.add_field(name="World Size", value=world_size, inline=True)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcseed", description="View world seed")
+async def mcseed(interaction: discord.Interaction):
+    """View world seed"""
+    await interaction.response.defer()
+    
+    try:
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        seed_cmd = f"grep 'level-seed=' {config_file} | cut -d'=' -f2"
+        process = await asyncio.create_subprocess_shell(
+            seed_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        seed = stdout.decode().strip() or "Random"
+        
+        embed = discord.Embed(
+            title="🌱 World Seed",
+            description=f"`{seed}`",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT PLAYER TELEPORTATION
+# =========================================================
+@bot.tree.command(name="mctp", description="Teleport player to another player (Admin only)")
+@discord.app_commands.describe(player1="First player", player2="Second player")
+async def mctp(interaction: discord.Interaction, player1: str, player2: str):
+    """Teleport player to another player"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"tp {player1} {player2}\n")
+        except Exception as e:
+            logger.warning(f"Could not write tp command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Teleportation",
+            description=f"**{player1}** teleported to **{player2}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT SERVER RULES
+# =========================================================
+@bot.tree.command(name="mcsetrules", description="Set server rules (Admin only)")
+@discord.app_commands.describe(rules="Rules (one per line, use \\n for newlines)")
+async def mcsetrules(interaction: discord.Interaction, rules: str):
+    """Set server rules"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        rule_list = [r.strip() for r in rules.split('\\n') if r.strip()]
+        bot.mc_server_rules[guild_id] = rule_list
+        
+        embed = discord.Embed(
+            title="✅ Rules Updated",
+            description="Server rules have been set:",
+            color=discord.Color.green()
+        )
+        for i, rule in enumerate(rule_list[:10], 1):  # Limit to 10 rules
+            embed.add_field(name=f"Rule {i}", value=rule, inline=False)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcrules", description="View server rules")
+async def mcrules(interaction: discord.Interaction):
+    """View server rules"""
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        rules = bot.mc_server_rules.get(guild_id, [])
+        
+        if rules:
+            embed = discord.Embed(
+                title="📜 Server Rules",
+                color=discord.Color.blue()
+            )
+            for i, rule in enumerate(rules, 1):
+                embed.add_field(name=f"Rule {i}", value=rule, inline=False)
+        else:
+            embed = discord.Embed(
+                title="📜 Server Rules",
+                description="No rules set yet.",
+                color=discord.Color.orange()
+            )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT RESOURCE MONITORING
+# =========================================================
+@bot.tree.command(name="mcresourcealert", description="Configure resource usage alerts (Admin only)")
+@discord.app_commands.describe(enabled="Enable alerts", cpu_threshold="CPU threshold % (default: 80)", mem_threshold="Memory threshold % (default: 80)")
+async def mcresourcealert(interaction: discord.Interaction, enabled: bool, cpu_threshold: int = 80, mem_threshold: int = 80):
+    """Configure resource alerts"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            if guild_id not in bot.mc_resource_alerts:
+                bot.mc_resource_alerts[guild_id] = {}
+            
+            bot.mc_resource_alerts[guild_id]['enabled'] = True
+            bot.mc_resource_alerts[guild_id]['cpu_threshold'] = max(1, min(100, cpu_threshold))
+            bot.mc_resource_alerts[guild_id]['mem_threshold'] = max(1, min(100, mem_threshold))
+            
+            embed = discord.Embed(
+                title="✅ Resource Alerts Enabled",
+                description=f"Alerts will trigger when:\n• CPU > {cpu_threshold}%\n• Memory > {mem_threshold}%",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Auto-Restart", value="Server will auto-restart if usage exceeds 95%", inline=False)
+            
+            if not minecraft_resource_monitor.is_running():
+                minecraft_resource_monitor.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_resource_alerts:
+                bot.mc_resource_alerts[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Resource Alerts Disabled",
+                description="Resource monitoring has been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT PERFORMANCE DASHBOARD
+# =========================================================
+@bot.tree.command(name="mcdashboard", description="Set up performance dashboard (Admin only)")
+@discord.app_commands.describe(channel="Channel for dashboard (leave empty to disable)")
+async def mcdashboard(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Configure performance dashboard"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if channel:
+            bot.mc_dashboard_channel = channel.id
+            
+            # Create initial dashboard
+            embed = discord.Embed(
+                title="📊 Minecraft Server Dashboard",
+                description="Dashboard will update every 5 minutes",
+                color=discord.Color.blue()
+            )
+            message = await channel.send(embed=embed)
+            bot.mc_dashboard_message_id = message.id
+            
+            if not minecraft_dashboard_updater.is_running():
+                minecraft_dashboard_updater.start()
+            
+            await interaction.followup.send(f"✅ Dashboard enabled in {channel.mention}")
+        else:
+            bot.mc_dashboard_channel = None
+            bot.mc_dashboard_message_id = None
+            await interaction.followup.send("❌ Dashboard disabled")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT COMMAND ALIASES
+# =========================================================
+@bot.tree.command(name="mcalias", description="Create command alias (Admin only)")
+@discord.app_commands.describe(alias="Alias name", command="Command to execute")
+async def mcalias(interaction: discord.Interaction, alias: str, command: str):
+    """Create command alias"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        if guild_id not in bot.mc_command_aliases:
+            bot.mc_command_aliases[guild_id] = {}
+        
+        bot.mc_command_aliases[guild_id][alias.lower()] = command
+        
+        embed = discord.Embed(
+            title="✅ Alias Created",
+            description=f"`{alias}` → `{command}`",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
 @bot.tree.command(name="mcconsole", description="Start/stop live console streaming (Admin only)")
 async def mcconsole(interaction: discord.Interaction, action: str):
     """Toggle live console streaming"""
@@ -9032,6 +9658,224 @@ async def minecraft_scheduled_backups():
 
 @minecraft_scheduled_backups.before_loop
 async def before_scheduled_backups():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT SCHEDULED RESTARTS
+# =========================================================
+@tasks.loop(minutes=1)
+async def minecraft_scheduled_restarts():
+    """Check for scheduled restart times"""
+    try:
+        from datetime import datetime, time as dt_time
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+        current_day = now.strftime("%A").lower()
+        
+        for guild_id, restart_config in bot.mc_scheduled_restarts.items():
+            if not restart_config.get('enabled', False):
+                continue
+            
+            restart_time = restart_config.get('time', '03:00')
+            days = restart_config.get('days', [])
+            
+            # Check if it's time for restart
+            if current_time == restart_time and current_day in days:
+                # Check if we already restarted today
+                last_restart = restart_config.get('last_restart_date')
+                today = now.strftime("%Y-%m-%d")
+                
+                if last_restart != today:
+                    # Warn players 5 minutes before
+                    if await is_minecraft_running():
+                        try:
+                            command_file = f"{MINECRAFT_DIR}/command_input.txt"
+                            with open(command_file, 'a') as f:
+                                f.write(f"say Server will restart in 5 minutes!\n")
+                        except:
+                            pass
+                        
+                        await asyncio.sleep(300)  # Wait 5 minutes
+                        
+                        # Restart server
+                        restart_cmd = f"sudo systemctl restart {MINECRAFT_SERVICE}"
+                        process = await asyncio.create_subprocess_shell(
+                            restart_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        await process.communicate()
+                        
+                        restart_config['last_restart_date'] = today
+                        
+                        # Send notification
+                        if bot.mc_notification_channel:
+                            channel = bot.get_channel(bot.mc_notification_channel)
+                            if channel:
+                                embed = discord.Embed(
+                                    title="🔄 Scheduled Restart",
+                                    description="Server has been restarted as scheduled.",
+                                    color=discord.Color.orange()
+                                )
+                                embed.timestamp = discord.utils.utcnow()
+                                await channel.send(embed=embed)
+                        
+                        logger.info(f"✅ Scheduled restart completed at {restart_time}")
+    except Exception as e:
+        logger.error(f"Error in scheduled restarts: {e}", exc_info=True)
+
+@minecraft_scheduled_restarts.before_loop
+async def before_scheduled_restarts():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT RESOURCE MONITORING
+# =========================================================
+@tasks.loop(minutes=5)
+async def minecraft_resource_monitor():
+    """Monitor server resources and send alerts"""
+    try:
+        if not await is_minecraft_running():
+            return
+        
+        for guild_id, alert_config in bot.mc_resource_alerts.items():
+            if not alert_config.get('enabled', False):
+                continue
+            
+            # Get CPU usage
+            cpu_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $3}}'"
+            cpu_process = await asyncio.create_subprocess_shell(
+                cpu_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            cpu_stdout, _ = await cpu_process.communicate()
+            cpu_lines = cpu_stdout.decode().strip().split('\n')
+            cpu_usage = sum(float(line.strip()) for line in cpu_lines if line.strip().replace('.', '').isdigit())
+            
+            # Get memory usage
+            mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4}}'"
+            mem_process = await asyncio.create_subprocess_shell(
+                mem_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            mem_stdout, _ = await mem_process.communicate()
+            mem_lines = mem_stdout.decode().strip().split('\n')
+            mem_usage = sum(float(line.strip()) for line in mem_lines if line.strip().replace('.', '').isdigit())
+            
+            cpu_threshold = alert_config.get('cpu_threshold', 80)
+            mem_threshold = alert_config.get('mem_threshold', 80)
+            
+            # Check thresholds
+            if cpu_usage > cpu_threshold or mem_usage > mem_threshold:
+                # Send alert
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="⚠️ High Resource Usage",
+                            description="Minecraft server is using high resources!",
+                            color=discord.Color.red()
+                        )
+                        embed.add_field(name="CPU Usage", value=f"{cpu_usage:.1f}%", inline=True)
+                        embed.add_field(name="Memory Usage", value=f"{mem_usage:.1f}%", inline=True)
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                        
+                        # Auto-restart if extremely high
+                        if cpu_usage > 95 or mem_usage > 95:
+                            restart_cmd = f"sudo systemctl restart {MINECRAFT_SERVICE}"
+                            await asyncio.create_subprocess_shell(restart_cmd)
+                            await channel.send("🔄 Server auto-restarted due to extreme resource usage.")
+    except Exception as e:
+        logger.error(f"Error in resource monitoring: {e}", exc_info=True)
+
+@minecraft_resource_monitor.before_loop
+async def before_resource_monitor():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT PERFORMANCE DASHBOARD
+# =========================================================
+@tasks.loop(minutes=5)
+async def minecraft_dashboard_updater():
+    """Update Minecraft performance dashboard"""
+    try:
+        if not bot.mc_dashboard_channel or not bot.mc_dashboard_message_id:
+            return
+        
+        channel = bot.get_channel(bot.mc_dashboard_channel)
+        if not channel:
+            return
+        
+        is_running = await is_minecraft_running()
+        
+        # Get performance metrics
+        cpu_usage = 0.0
+        mem_usage = 0.0
+        online_players = 0
+        
+        if is_running:
+            # CPU
+            cpu_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $3}}'"
+            cpu_process = await asyncio.create_subprocess_shell(
+                cpu_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            cpu_stdout, _ = await cpu_process.communicate()
+            cpu_lines = cpu_stdout.decode().strip().split('\n')
+            cpu_usage = sum(float(line.strip()) for line in cpu_lines if line.strip().replace('.', '').isdigit())
+            
+            # Memory
+            mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4}}'"
+            mem_process = await asyncio.create_subprocess_shell(
+                mem_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            mem_stdout, _ = await mem_process.communicate()
+            mem_lines = mem_stdout.decode().strip().split('\n')
+            mem_usage = sum(float(line.strip()) for line in mem_lines if line.strip().replace('.', '').isdigit())
+            
+            # Online players
+            logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager | grep -E 'Player connected|Player disconnected'"
+            logs_process = await asyncio.create_subprocess_shell(
+                logs_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logs_stdout, _ = await logs_process.communicate()
+            logs = logs_stdout.decode()
+            online_players = len([l for l in logs.split('\n') if 'Player connected' in l]) - len([l for l in logs.split('\n') if 'Player disconnected' in l])
+            online_players = max(0, online_players)
+        
+        embed = discord.Embed(
+            title="📊 Minecraft Server Dashboard",
+            color=discord.Color.green() if is_running else discord.Color.red(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        status = "🟢 Online" if is_running else "🔴 Offline"
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="CPU Usage", value=f"{cpu_usage:.1f}%", inline=True)
+        embed.add_field(name="Memory Usage", value=f"{mem_usage:.1f}%", inline=True)
+        embed.add_field(name="Online Players", value=str(online_players), inline=True)
+        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=False)
+        
+        try:
+            message = await channel.fetch_message(bot.mc_dashboard_message_id)
+            await message.edit(embed=embed)
+        except:
+            # Create new message if old one doesn't exist
+            message = await channel.send(embed=embed)
+            bot.mc_dashboard_message_id = message.id
+    except Exception as e:
+        logger.error(f"Error updating dashboard: {e}", exc_info=True)
+
+@minecraft_dashboard_updater.before_loop
+async def before_dashboard_updater():
     await bot.wait_until_ready()
 
 # -------------------------

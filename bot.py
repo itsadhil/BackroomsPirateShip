@@ -3429,21 +3429,21 @@ async def process_fitgirl_torrent_submission(interaction, user):
         
         # Create thread in forum channel
         try:
-        thread = await output_channel.create_thread(
-            name=thread_name,
-            content=f"**{thread_name}**",
-            embed=embed,
-            file=public_torrent_file,
-            view=view
-        )
-        logger.info(f"✅ Created forum thread: {thread_name} (ID: {thread.id})")
-    except Exception as e:
-        logger.error(f"Failed to create forum thread: {e}", exc_info=True)
-        await interaction.followup.send(
-            f"❌ Failed to create forum thread: {str(e)}",
-            ephemeral=True
-        )
-        return
+            thread = await output_channel.create_thread(
+                name=thread_name,
+                content=f"**{thread_name}**",
+                embed=embed,
+                file=public_torrent_file,
+                view=view
+            )
+            logger.info(f"✅ Created forum thread: {thread_name} (ID: {thread.id})")
+        except Exception as e:
+            logger.error(f"Failed to create forum thread: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ Failed to create forum thread: {str(e)}",
+                ephemeral=True
+            )
+            return
     
     # Get public torrent URL and update with button
     try:

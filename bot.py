@@ -3429,14 +3429,18 @@ async def process_fitgirl_torrent_submission(interaction, user):
         view = GameButtonView(data['game_link'], None)
         
         # Create thread in forum channel
+        thread_result = None
+        thread = None
         try:
-            thread = await output_channel.create_thread(
+            thread_result = await output_channel.create_thread(
                 name=thread_name,
                 content=f"**{thread_name}**",
                 embed=embed,
                 file=public_torrent_file,
                 view=view
             )
+            # create_thread returns ThreadWithMessage, access thread via .thread
+            thread = thread_result.thread if hasattr(thread_result, 'thread') else thread_result
             logger.info(f"✅ Created forum thread: {thread_name} (ID: {thread.id})")
         except Exception as e:
             logger.error(f"Failed to create forum thread: {e}", exc_info=True)
@@ -3448,10 +3452,10 @@ async def process_fitgirl_torrent_submission(interaction, user):
         
         # Get public torrent URL and update with button
         try:
-            # Forum threads have starter_message, not message
-            starter_message = getattr(thread, 'starter_message', None)
+            # ThreadWithMessage has .message attribute for the starter message
+            starter_message = getattr(thread_result, 'message', None) if thread_result else None
             if not starter_message:
-                # Try to fetch the message if it's not available
+                # Fallback: try to get from thread
                 try:
                     async for message in thread.history(limit=1):
                         starter_message = message
@@ -3469,7 +3473,7 @@ async def process_fitgirl_torrent_submission(interaction, user):
         # Log to input channel
         try:
             version_text = f"\n📦 **Version:** {data['version']}" if data.get('version') else ""
-            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            thread_mention = thread.mention
             await input_channel.send(
                 f"📥 **New Game Submitted** (Auto from FitGirl)\n"
                 f"👤 **User:** {user.mention}\n"
@@ -3498,7 +3502,7 @@ async def process_fitgirl_torrent_submission(interaction, user):
         
         # DM the user
         try:
-            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            thread_mention = thread.mention
             dm_embed = discord.Embed(
                 title="✅ Game Added Successfully!",
                 description=f"**{thread_name}** has been added from FitGirl Repacks!",
@@ -3519,7 +3523,7 @@ async def process_fitgirl_torrent_submission(interaction, user):
         
         # Follow up in the interaction
         try:
-            thread_mention = thread.mention if hasattr(thread, 'mention') else f"<#{thread.id}>"
+            thread_mention = thread.mention
             await interaction.followup.send(
                 f"✅ **{thread_name}** has been added to {thread_mention}!\n"
                 f"📬 Check your DMs for details!",

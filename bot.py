@@ -1320,19 +1320,28 @@ async def on_ready():
         print(f"✅ Minecraft scheduled backups monitor started")
     
     # Start Minecraft scheduled restarts
-    if not minecraft_scheduled_restarts.is_running():
-        minecraft_scheduled_restarts.start()
-        print(f"✅ Minecraft scheduled restarts monitor started")
+    try:
+        if not minecraft_scheduled_restarts.is_running():
+            minecraft_scheduled_restarts.start()
+            print(f"✅ Minecraft scheduled restarts monitor started")
+    except Exception as e:
+        logger.error(f"Failed to start scheduled restarts: {e}", exc_info=True)
     
     # Start Minecraft resource monitor
-    if not minecraft_resource_monitor.is_running():
-        minecraft_resource_monitor.start()
-        print(f"✅ Minecraft resource monitor started")
+    try:
+        if not minecraft_resource_monitor.is_running():
+            minecraft_resource_monitor.start()
+            print(f"✅ Minecraft resource monitor started")
+    except Exception as e:
+        logger.error(f"Failed to start resource monitor: {e}", exc_info=True)
     
     # Start Minecraft dashboard updater
-    if not minecraft_dashboard_updater.is_running():
-        minecraft_dashboard_updater.start()
-        print(f"✅ Minecraft dashboard updater started")
+    try:
+        if not minecraft_dashboard_updater.is_running():
+            minecraft_dashboard_updater.start()
+            print(f"✅ Minecraft dashboard updater started")
+    except Exception as e:
+        logger.error(f"Failed to start dashboard updater: {e}", exc_info=True)
     
     # LAST: Update status to online after everything is loaded
     await update_status_message("online")
@@ -8732,7 +8741,13 @@ async def mcsetmotd(interaction: discord.Interaction, motd: str):
 # MINECRAFT GAME MODE & DIFFICULTY
 # =========================================================
 @bot.tree.command(name="mcdifficulty", description="Set server difficulty (Admin only)")
-@discord.app_commands.describe(difficulty="Difficulty level", choices=["easy", "normal", "hard", "peaceful"])
+@discord.app_commands.choices(difficulty=[
+    discord.app_commands.Choice(name="Easy", value="easy"),
+    discord.app_commands.Choice(name="Normal", value="normal"),
+    discord.app_commands.Choice(name="Hard", value="hard"),
+    discord.app_commands.Choice(name="Peaceful", value="peaceful")
+])
+@discord.app_commands.describe(difficulty="Difficulty level")
 async def mcdifficulty(interaction: discord.Interaction, difficulty: str):
     """Set server difficulty"""
     if not interaction.user.guild_permissions.administrator:
@@ -9667,7 +9682,7 @@ async def before_scheduled_backups():
 async def minecraft_scheduled_restarts():
     """Check for scheduled restart times"""
     try:
-        from datetime import datetime, time as dt_time
+        from datetime import datetime
         now = datetime.now()
         current_time = now.strftime("%H:%M")
         current_day = now.strftime("%A").lower()

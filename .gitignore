@@ -28,7 +28,17 @@ bot_state.json
 fitgirl_seen_posts.json
 link_health_data.json
 steam_links.json
+user_data.json
+reviews_data.json
+tags_data.json
+link_health_data.json
+webhooks_data.json
+collections_data.json
+compatibility_data.json
 backups/
+
+# Data directory (all JSON files moved here)
+data/
 
 # Logs
 *.log

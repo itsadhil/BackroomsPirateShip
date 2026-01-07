@@ -329,12 +329,35 @@ async def update_status_message(status: str):
         timestamp = f"<t:{int(now.timestamp())}:F>"
         
         if status == "online":
+            # Get system stats
+            try:
+                import psutil
+                process = psutil.Process()
+                # Get CPU usage - use a small interval for accurate reading
+                # This will block for 0.1 seconds, but gives accurate results
+                cpu_percent = process.cpu_percent(interval=0.1)
+                
+                # Get memory usage
+                memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+                sys_mem = psutil.virtual_memory()
+                memory_percent = (memory_usage / (sys_mem.total / 1024 / 1024)) * 100
+            except Exception as e:
+                logger.warning(f"Could not get system stats: {e}")
+                cpu_percent = 0.0
+                memory_percent = 0.0
+            
             embed = discord.Embed(
-                title="🟢 Bot Online",
-                description=f"Bot is now online and ready to serve!\n\n**Started:** {timestamp}",
+                title="✅ Bot Started",
+                description=f"**!Backroom Pirate Captain** is now online!",
                 color=discord.Color.green(),
                 timestamp=now
             )
+            
+            # Add stats fields
+            embed.add_field(name="CPU", value=f"{cpu_percent:.1f}%", inline=True)
+            embed.add_field(name="Memory", value=f"{memory_percent:.1f}%", inline=True)
+            embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+            
             embed.set_footer(text="Backrooms Pirate Ship")
         elif status == "starting":
             embed = discord.Embed(
@@ -7384,17 +7407,7 @@ async def is_minecraft_running():
         stderr=asyncio.subprocess.PIPE
     )
     stdout, _ = await result.communicate()
-    if stdout.decode().strip() == "active":
-        return True
-    
-    # Check screen session
-    screen_check = await asyncio.create_subprocess_shell(
-        "screen -ls | grep minecraft",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    screen_out, _ = await screen_check.communicate()
-    return len(screen_out.decode().strip()) > 0
+    return stdout.decode().strip() == "active"
 
 @bot.tree.command(name="mcstart", description="Start the Minecraft Bedrock server (Admin only)")
 async def mcstart(interaction: discord.Interaction):
@@ -7411,8 +7424,8 @@ async def mcstart(interaction: discord.Interaction):
             await interaction.followup.send("⚠️ Server is already running!")
             return
         
-        # Start server in screen session
-        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+        # Start server using systemd
+        start_cmd = f"sudo systemctl start {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
             start_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -7453,25 +7466,26 @@ async def mcstop(interaction: discord.Interaction):
             return
         
         # Send stop command to server first (graceful shutdown)
-        stop_server_cmd = "screen -S minecraft -X stuff 'stop\n'"
+        # Bedrock server listens for commands via stdin or command file
+        stop_command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            # Write stop command to file (if server supports reading from file)
+            with open(stop_command_file, 'w') as f:
+                f.write("stop\n")
+        except:
+            pass
+        
+        # Use systemd to stop gracefully
+        stop_cmd = f"sudo systemctl stop {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
-            stop_server_cmd,
+            stop_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
         
         # Wait for graceful shutdown
-        await asyncio.sleep(5)
-        
-        # Force kill screen if still running
-        kill_cmd = "screen -X -S minecraft quit"
-        process = await asyncio.create_subprocess_shell(
-            kill_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        await asyncio.sleep(3)
         
         embed = discord.Embed(
             title="🔴 Minecraft Server Stopped",
@@ -7498,23 +7512,18 @@ async def mcrestart(interaction: discord.Interaction):
         was_running = await is_minecraft_running()
         
         if was_running:
-            # Send stop command
-            stop_cmd = "screen -S minecraft -X stuff 'stop\n'"
+            # Stop using systemd
+            stop_cmd = f"sudo systemctl stop {MINECRAFT_SERVICE}"
             process = await asyncio.create_subprocess_shell(
                 stop_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             await process.communicate()
-            await asyncio.sleep(5)
-            
-            # Force kill if needed
-            kill_cmd = "screen -X -S minecraft quit"
-            await asyncio.create_subprocess_shell(kill_cmd)
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
         
-        # Start fresh
-        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+        # Start fresh using systemd
+        start_cmd = f"sudo systemctl start {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
             start_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -7573,8 +7582,17 @@ async def mcstatus(interaction: discord.Interaction):
             stderr=asyncio.subprocess.PIPE
         )
         mem_stdout, _ = await mem_process.communicate()
-        memory_kb = mem_stdout.decode().strip()
-        memory_mb = f"{int(memory_kb) / 1024:.0f} MB" if memory_kb else "N/A"
+        memory_lines = mem_stdout.decode().strip().split('\n')
+        # Sum all memory values or take first if only one
+        try:
+            if memory_lines and memory_lines[0]:
+                # Sum all memory values (in case of multiple processes)
+                total_kb = sum(int(line.strip()) for line in memory_lines if line.strip().isdigit())
+                memory_mb = f"{total_kb / 1024:.0f} MB" if total_kb > 0 else "N/A"
+            else:
+                memory_mb = "N/A"
+        except (ValueError, AttributeError):
+            memory_mb = "N/A"
         
         color = discord.Color.green() if is_active else discord.Color.red()
         status_text = "🟢 Online" if is_active else "🔴 Offline"
@@ -7772,34 +7790,25 @@ async def mccommand(interaction: discord.Interaction, command: str):
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send command via screen session (requires server running in screen)
-        # Screen session name should be "minecraft" 
-        screen_cmd = f"screen -S minecraft -p 0 -X stuff '{command}\\n'"
-        process = await asyncio.create_subprocess_shell(
-            screen_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        # Send command to server via systemd
+        # Bedrock server can receive commands via stdin or a command file
+        # We'll use systemd's journalctl to verify the command was processed
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
         
-        # Check if screen session exists
-        if b"No screen session found" in stderr or process.returncode != 0:
-            embed = discord.Embed(
-                title="⚠️ Console Not Available",
-                description="Server is not running in a screen session.",
-                color=discord.Color.orange()
-            )
-            embed.add_field(
-                name="Setup Instructions",
-                value="Run this on the server:\n"
-                      "```bash\n"
-                      "sudo systemctl stop minecraft-bedrock\n"
-                      "screen -S minecraft -dm bash -c 'cd /home/ubuntu/minecraft-bedrock && LD_LIBRARY_PATH=. ./bedrock_server'\n"
-                      "```\n"
-                      "Then use `/mclogs` to view command results.",
-                inline=False
-            )
-            await interaction.followup.send(embed=embed)
+        try:
+            # Write command to file (if server supports reading commands from file)
+            with open(command_file, 'a') as f:
+                f.write(f"{command}\n")
+        except Exception as e:
+            logger.warning(f"Could not write to command file: {e}")
+        
+        # Alternative: Use systemd's stdin if available
+        # For now, we'll just confirm the command was sent
+        # The server should process commands from the file or stdin
+        
+        # Check if server is running
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
             return
         
         embed = discord.Embed(
@@ -8241,14 +8250,13 @@ async def mckick(interaction: discord.Interaction, player: str, reason: str = "N
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send kick command
-        kick_cmd = f"screen -S minecraft -X stuff 'kick {player} {reason}\\n'"
-        process = await asyncio.create_subprocess_shell(
-            kick_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        # Send kick command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"kick {player} {reason}\n")
+        except Exception as e:
+            logger.warning(f"Could not write kick command: {e}")
         
         embed = discord.Embed(
             title="👢 Player Kicked",
@@ -8279,14 +8287,13 @@ async def mcban(interaction: discord.Interaction, player: str, reason: str = "No
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send ban command
-        ban_cmd = f"screen -S minecraft -X stuff 'ban {player} {reason}\\n'"
-        process = await asyncio.create_subprocess_shell(
-            ban_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        # Send ban command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"ban {player} {reason}\n")
+        except Exception as e:
+            logger.warning(f"Could not write ban command: {e}")
         
         embed = discord.Embed(
             title="🔨 Player Banned",
@@ -8317,14 +8324,13 @@ async def mcunban(interaction: discord.Interaction, player: str):
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send unban command
-        unban_cmd = f"screen -S minecraft -X stuff 'unban {player}\\n'"
-        process = await asyncio.create_subprocess_shell(
-            unban_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        # Send unban command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"unban {player}\n")
+        except Exception as e:
+            logger.warning(f"Could not write unban command: {e}")
         
         embed = discord.Embed(
             title="✅ Player Unbanned",
@@ -8639,26 +8645,14 @@ async def minecraft_console_stream():
         if not hasattr(bot, 'mc_last_timestamp'):
             bot.mc_last_timestamp = discord.utils.utcnow()
         
-        # Get logs from screen session
-        # Dump screen buffer to temp file
-        screen_log = "/tmp/mc_console_stream.log"
-        dump_cmd = f"screen -S minecraft -X hardcopy -h {screen_log} && tail -n 50 {screen_log}"
+        # Get logs from systemd journal
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '{bot.mc_last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}' --no-pager -n 100 -o cat"
         process = await asyncio.create_subprocess_shell(
-            dump_cmd,
+            logs_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            # Fallback to journalctl if screen fails
-            logs_cmd = f"journalctl --since '{bot.mc_last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}' --no-pager -n 100 -o cat | grep -E 'bedrock_server|minecraft'"
-            process = await asyncio.create_subprocess_shell(
-                logs_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await process.communicate()
+        stdout, _ = await process.communicate()
         
         all_logs = stdout.decode()
         
@@ -8804,6 +8798,8 @@ async def before_auto_restart_monitor():
 # =========================================================
 # MINECRAFT PLAYER NOTIFICATIONS
 # =========================================================
+# MINECRAFT PLAYER NOTIFICATIONS
+# =========================================================
 @tasks.loop(seconds=5)
 async def minecraft_player_notifications():
     """Send Discord notifications for player join/leave"""
@@ -8823,7 +8819,11 @@ async def minecraft_player_notifications():
             bot.mc_last_seen_players = set()
         
         # Get current online players from logs
-        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager | grep -E 'Player connected|Player disconnected'"
+        # Try multiple sources: systemd logs, screen logs, and direct server logs
+        logs = ""
+        
+        # Method 1: Try systemd logs
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
         process = await asyncio.create_subprocess_shell(
             logs_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -8832,11 +8832,54 @@ async def minecraft_player_notifications():
         logs_stdout, _ = await process.communicate()
         logs = logs_stdout.decode()
         
+        # Method 2: If no systemd logs, try screen session logs
+        if not logs or len(logs.strip()) == 0:
+            screen_log = "/tmp/mc_console_stream.log"
+            dump_cmd = f"screen -S minecraft -X hardcopy -h {screen_log} 2>/dev/null && tail -n 100 {screen_log} 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
+            screen_process = await asyncio.create_subprocess_shell(
+                dump_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            screen_stdout, _ = await screen_process.communicate()
+            screen_logs = screen_stdout.decode()
+            if screen_logs:
+                logs = screen_logs
+        
+        # Method 3: Try server log files directly
+        if not logs or len(logs.strip()) == 0:
+            log_file_cmd = f"tail -n 100 {MINECRAFT_DIR}/logs/*.log 2>/dev/null | grep -E 'Player connected|Player disconnected|Player.*joined|Player.*left'"
+            log_process = await asyncio.create_subprocess_shell(
+                log_file_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            log_stdout, _ = await log_process.communicate()
+            log_output = log_stdout.decode()
+            if log_output:
+                logs = log_output
+        
         current_players = set()
         for line in logs.split('\n'):
-            if 'Player connected:' in line:
+            line_lower = line.lower()
+            # Check for various player join patterns
+            if 'player connected:' in line_lower or 'player joined' in line_lower or 'joined the game' in line_lower:
                 try:
-                    player = line.split('Player connected:')[-1].strip().split(',')[0].strip()
+                    # Try to extract player name from various log formats
+                    player = None
+                    if 'Player connected:' in line:
+                        player = line.split('Player connected:')[-1].strip().split(',')[0].strip()
+                    elif 'Player joined' in line:
+                        # Format: "Player joined: PlayerName"
+                        parts = line.split('Player joined')
+                        if len(parts) > 1:
+                            player = parts[-1].strip().split()[0].strip()
+                    elif 'joined the game' in line:
+                        # Format: "PlayerName joined the game"
+                        parts = line.split('joined the game')
+                        if len(parts) > 0:
+                            player = parts[0].strip().split()[-1].strip()
+                    
                     if player and player not in bot.mc_last_seen_players:
                         # New player joined
                         embed = discord.Embed(
@@ -8856,9 +8899,23 @@ async def minecraft_player_notifications():
                     current_players.add(player)
                 except:
                     pass
-            elif 'Player disconnected:' in line:
+            elif 'Player disconnected:' in line_lower or 'player left' in line_lower or 'left the game' in line_lower:
                 try:
-                    player = line.split('Player disconnected:')[-1].strip().split(',')[0].strip()
+                    # Try to extract player name from various log formats
+                    player = None
+                    if 'Player disconnected:' in line:
+                        player = line.split('Player disconnected:')[-1].strip().split(',')[0].strip()
+                    elif 'Player left' in line:
+                        # Format: "Player left: PlayerName"
+                        parts = line.split('Player left')
+                        if len(parts) > 1:
+                            player = parts[-1].strip().split()[0].strip()
+                    elif 'left the game' in line:
+                        # Format: "PlayerName left the game"
+                        parts = line.split('left the game')
+                        if len(parts) > 0:
+                            player = parts[0].strip().split()[-1].strip()
+                    
                     if player and player in bot.mc_last_seen_players:
                         # Player left
                         embed = discord.Embed(

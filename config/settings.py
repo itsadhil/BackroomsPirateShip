@@ -45,6 +45,12 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
     
+    # AI Assistant
+    AI_ENABLED: bool = os.getenv("AI_ENABLED", "true").lower() == "true"
+    AI_API_KEY: str = os.getenv("OPENAI_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "openai").lower()  # openai, groq, anthropic
+    AI_MODEL: str = os.getenv("AI_MODEL", "")  # Optional: override default model
+    
     # Data files
     DATA_DIR: Path = Path("data")
     RSS_SEEN_FILE: Path = DATA_DIR / "fitgirl_seen_posts.json"

@@ -34,6 +34,7 @@ from utils.steam_api import SteamAPI, format_playtime, get_personastate_string
 from utils.steam_linker import SteamLinker
 from utils.retry import retry
 from utils.rate_limiter import get_steam_limiter, get_igdb_limiter
+from utils.ai_assistant import AIAssistant, get_chat_context
 
 # -------------------------
 # LOAD ENV (for backward compatibility)
@@ -136,6 +137,7 @@ bot.steam_sessions = {}  # Track gaming sessions (discord_id: [{game, start, end
 bot.steam_wishlists = {}  # Track Steam wishlists (discord_id: [game_ids])
 bot.game_nights = {}  # Track scheduled game nights (guild_id: [{host, game, time, participants}])
 bot.squad_notifications = {}  # Track squad up notifications (game: [user_ids])
+bot.ai_assistant = None  # AI Assistant instance
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -1272,6 +1274,20 @@ async def on_ready():
         logger.info("Browser pool initialized")
     except Exception as e:
         logger.error(f"Error initializing browser pool: {e}", exc_info=True)
+    
+    # Initialize AI Assistant
+    if settings.AI_ENABLED:
+        try:
+            if settings.AI_API_KEY:
+                bot.ai_assistant = AIAssistant(
+                    api_key=settings.AI_API_KEY,
+                    api_provider=settings.AI_PROVIDER
+                )
+                logger.info(f"✅ AI Assistant initialized (Provider: {settings.AI_PROVIDER})")
+            else:
+                logger.warning("⚠️ AI_ENABLED is true but no API key found. Set OPENAI_API_KEY or GROQ_API_KEY in .env")
+        except Exception as e:
+            logger.error(f"Error initializing AI Assistant: {e}", exc_info=True)
 
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
@@ -2408,6 +2424,19 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
+    # AI Assistant
+    if settings.AI_ENABLED and bot.ai_assistant:
+        embed.add_field(
+            name="🤖 AI Assistant",
+            value=(
+                "Mention the bot (`@BotName`) and ask a question!\n"
+                "The bot can answer questions about recent chat activity.\n"
+                "Example: `@BotName what are we discussing?`\n"
+                "`/aitest` - Test the AI assistant"
+            ),
+            inline=False
+        )
+    
     # Search & Browse Commands
     embed.add_field(
         name="🔍 Search & Browse",
@@ -2492,6 +2521,59 @@ async def help_command(interaction: discord.Interaction):
     embed.timestamp = discord.utils.utcnow()
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# -------------------------
+# AI ASSISTANT COMMANDS
+# -------------------------
+@bot.tree.command(name="aitest", description="Test the AI assistant")
+@discord.app_commands.describe(question="Question to ask the AI assistant")
+async def aitest(interaction: discord.Interaction, question: str = "What's happening in this channel?"):
+    """Test the AI assistant."""
+    if not await check_command_permissions(interaction):
+        return
+    
+    if not settings.AI_ENABLED:
+        await interaction.response.send_message("❌ AI Assistant is disabled. Set `AI_ENABLED=true` in .env", ephemeral=True)
+        return
+    
+    if not bot.ai_assistant:
+        await interaction.response.send_message("❌ AI Assistant is not initialized. Check your API key configuration.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Get chat context
+        context = get_chat_context(interaction.channel.id)
+        context_text = context.format_context(limit=20)
+        
+        # Get AI response
+        response = await bot.ai_assistant.ask_question(
+            question=question,
+            context=context_text,
+            channel_name=interaction.channel.name,
+            server_name=interaction.guild.name if interaction.guild else "Discord Server"
+        )
+        
+        if response:
+            embed = discord.Embed(
+                title="🤖 AI Assistant Response",
+                description=response,
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="Question",
+                value=question,
+                inline=False
+            )
+            embed.set_footer(text=f"Provider: {settings.AI_PROVIDER}")
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("❌ Could not generate response. Check your API key and try again.", ephemeral=True)
+            
+    except Exception as e:
+        logger.error(f"Error in AI test: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 # -------------------------
 # MANUAL RSS CHECK COMMAND
@@ -4294,6 +4376,65 @@ async def on_message(message):
     # Ignore bot messages
     if message.author.bot:
         return
+    
+    # Track chat context for AI assistant
+    if settings.AI_ENABLED and message.content:
+        try:
+            context = get_chat_context(message.channel.id)
+            attachments = [att.url for att in message.attachments] if message.attachments else []
+            context.add_message(
+                author=message.author.display_name or message.author.name,
+                content=message.content,
+                timestamp=message.created_at,
+                attachments=attachments
+            )
+        except Exception as e:
+            logger.warning(f"Error tracking chat context: {e}")
+    
+    # Check if bot is mentioned and AI is enabled
+    if settings.AI_ENABLED and bot.user and bot.user.mentioned_in(message):
+        try:
+            # Extract question (remove mention)
+            question = message.content
+            # Remove bot mention
+            for mention in message.mentions:
+                question = question.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+            question = question.strip()
+            
+            if question:
+                # Show typing indicator
+                async with message.channel.typing():
+                    # Get chat context
+                    context = get_chat_context(message.channel.id)
+                    context_text = context.format_context(limit=20)
+                    
+                    # Get AI response
+                    if bot.ai_assistant:
+                        response = await bot.ai_assistant.ask_question(
+                            question=question,
+                            context=context_text,
+                            channel_name=message.channel.name,
+                            server_name=message.guild.name if message.guild else "Discord Server"
+                        )
+                        
+                        if response:
+                            # Send response
+                            embed = discord.Embed(
+                                description=response,
+                                color=discord.Color.blue()
+                            )
+                            embed.set_footer(text=f"Asked by {message.author.display_name}")
+                            await message.reply(embed=embed)
+                        else:
+                            await message.reply("❌ Sorry, I couldn't generate a response. Make sure your AI API key is configured correctly.")
+                    else:
+                        await message.reply("❌ AI Assistant is not initialized. Check your API key configuration.")
+        except Exception as e:
+            logger.error(f"Error handling AI question: {e}", exc_info=True)
+            try:
+                await message.reply("❌ Sorry, I encountered an error processing your question.")
+            except:
+                pass
     
     # Check if user has pending torrent submission
     if message.author.id in bot.pending_torrents:

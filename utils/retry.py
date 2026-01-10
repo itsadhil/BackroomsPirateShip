@@ -70,6 +70,16 @@ def retry(
         @wraps(func)
         async def wrapper(*args, **kwargs):
             # Call retry_async with retry parameters as keyword args, then function args/kwargs
+            # Make sure retry config params are not in kwargs
+            retry_config = {
+                'max_attempts': max_attempts,
+                'base_delay': base_delay,
+                'max_delay': max_delay,
+                'exponential_base': exponential_base,
+                'exceptions': exceptions
+            }
+            # Remove any retry config params from kwargs if they exist
+            func_kwargs = {k: v for k, v in kwargs.items() if k not in retry_config}
             return await retry_async(
                 func,
                 max_attempts=max_attempts,
@@ -78,7 +88,7 @@ def retry(
                 exponential_base=exponential_base,
                 exceptions=exceptions,
                 *args,
-                **kwargs
+                **func_kwargs
             )
         return wrapper
     return decorator

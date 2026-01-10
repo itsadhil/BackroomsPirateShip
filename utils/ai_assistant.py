@@ -8,7 +8,7 @@ import os
 from typing import List, Dict, Optional
 import aiohttp
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +22,22 @@ class ChatContext:
     
     def add_message(self, author: str, content: str, timestamp: datetime, attachments: List[str] = None):
         """Add a message to context."""
-        # Remove old messages
-        cutoff_time = datetime.utcnow() - timedelta(hours=self.max_age_hours)
-        self.messages = [
-            msg for msg in self.messages 
-            if msg['timestamp'] > cutoff_time
-        ]
+        # Ensure timestamp is timezone-aware
+        if timestamp.tzinfo is None:
+            # Assume UTC if naive
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        
+        # Remove old messages (ensure cutoff_time is also timezone-aware)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_age_hours)
+        filtered_messages = []
+        for msg in self.messages:
+            msg_timestamp = msg['timestamp']
+            # Ensure message timestamp is timezone-aware
+            if msg_timestamp.tzinfo is None:
+                msg_timestamp = msg_timestamp.replace(tzinfo=timezone.utc)
+            if msg_timestamp > cutoff_time:
+                filtered_messages.append(msg)
+        self.messages = filtered_messages
         
         # Add new message
         self.messages.append({
@@ -53,7 +63,11 @@ class ChatContext:
         
         lines = []
         for msg in recent:
-            timestamp = msg['timestamp'].strftime("%H:%M")
+            # Handle timezone-aware and naive timestamps
+            ts = msg['timestamp']
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            timestamp = ts.strftime("%H:%M")
             author = msg['author']
             content = msg['content'][:200]  # Truncate long messages
             lines.append(f"[{timestamp}] {author}: {content}")

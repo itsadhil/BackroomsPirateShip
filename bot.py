@@ -4472,9 +4472,9 @@ async def on_message(message):
                         logger.warning(f"Error handling message reference: {e}")
                         referenced_message = None
                     
-                    # Build context with referenced message if available
+                    # Build context based on whether this is a reply or direct mention
                     if referenced_message and isinstance(referenced_message, discord.Message):
-                        # Include the referenced message prominently in context
+                        # User replied to another message and tagged bot - focus on that conversation
                         ref_author = referenced_message.author.display_name or referenced_message.author.name
                         ref_content = referenced_message.content
                         ref_time = referenced_message.created_at.strftime("%H:%M")
@@ -4487,17 +4487,17 @@ async def on_message(message):
                             attachments=[att.url for att in referenced_message.attachments] if referenced_message.attachments else []
                         )
                         
-                        # Format context with highlighted referenced message
-                        context_text = f"=== REFERENCED MESSAGE (the one being asked about) ===\n"
-                        context_text += f"[{ref_time}] {ref_author}: {ref_content}\n"
-                        context_text += f"=== RECENT CHAT CONTEXT ===\n"
+                        # Format context with highlighted referenced message and surrounding conversation
+                        context_text = f"=== MESSAGE BEING ASKED ABOUT ===\n"
+                        context_text += f"[{ref_time}] {ref_author}: {ref_content}\n\n"
+                        context_text += f"=== RECENT CONVERSATION ===\n"
                         context_text += context.format_context(limit=15)
                         
-                        # Update question to indicate it's about the referenced message
-                        if not question.lower().startswith(("what", "explain", "why", "how", "who", "when", "where")):
-                            question = f"About this message: '{ref_content[:100]}' - {question}"
+                        # Update question to focus on the referenced message
+                        if not question.lower().startswith(("what", "explain", "why", "how", "who", "when", "where", "about")):
+                            question = f"About this message from {ref_author}: '{ref_content[:100]}' - {question}"
                     else:
-                        # Normal context without reply
+                        # Direct mention (not a reply) - just answer the question with general context
                         context_text = context.format_context(limit=20)
                     
                     # Get AI response
@@ -4552,13 +4552,20 @@ async def on_message(message):
                             if len(cleaned_response) > 2000:
                                 cleaned_response = cleaned_response[:1950] + "..."
                             
-                            # Send response
+                            # Send response - reply to the original message if it's a reply, otherwise reply to user
                             embed = discord.Embed(
                                 description=cleaned_response,
                                 color=discord.Color.blue()
                             )
                             embed.set_footer(text=f"Asked by {message.author.display_name}")
-                            await message.reply(embed=embed)
+                            
+                            # If user replied to another message, reply to that conversation
+                            if referenced_message and isinstance(referenced_message, discord.Message):
+                                # Reply to the original message (the one being asked about)
+                                await referenced_message.reply(embed=embed)
+                            else:
+                                # Direct mention - reply to the user's message
+                                await message.reply(embed=embed)
                         else:
                             await message.reply("❌ Sorry, I couldn't generate a response. Make sure your AI API key is configured correctly.")
                     else:

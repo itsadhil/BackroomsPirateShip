@@ -141,23 +141,34 @@ class AIAssistant:
         try:
             # Build system prompt - keep it concise to avoid leakage
             if is_reply:
-                system_prompt = f"""You are a helpful Discord bot assistant. A user replied to a message and asked about it.
+                system_prompt = f"""You are a helpful Discord bot. A user replied to a message and asked you about it.
 
-Focus on the REFERENCED MESSAGE section when answering. Be concise and direct.
+IMPORTANT RULES:
+- Answer naturally and conversationally, like a friend explaining something
+- Focus on the MESSAGE BEING ASKED ABOUT section
+- Do NOT mention user IDs, message IDs, or technical details
+- Do NOT say things like "the message says" or "the user with ID"
+- Just explain what the message means or answer the question directly
+- Be brief and helpful
 
 Context:
 {context}
 
-Answer the question about the referenced message. Do not repeat the context or explain your role."""
+Answer the question naturally about the message being asked about."""
             else:
-                system_prompt = f"""You are a helpful Discord bot assistant in #{channel_name}. Answer questions about recent chat activity.
+                system_prompt = f"""You are a helpful Discord bot in #{channel_name}. Answer questions about what's happening in the chat.
 
-Be concise and direct. Do not explain your role or repeat the context.
+IMPORTANT RULES:
+- Answer naturally and conversationally
+- Do NOT mention user IDs, message IDs, timestamps, or technical details
+- Do NOT say "the message from [user] says" - just explain naturally
+- Summarize conversations in a friendly way
+- Be brief and helpful
 
 Recent messages:
 {context}
 
-Answer the user's question based on the messages above."""
+Answer the user's question naturally based on the conversation above."""
 
             # Prepare API request
             if self.api_provider == "anthropic":

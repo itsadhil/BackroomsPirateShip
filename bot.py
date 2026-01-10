@@ -4514,7 +4514,7 @@ async def on_message(message):
                             # Clean response - remove any system prompt leakage or thinking
                             cleaned_response = response.strip()
                             
-                            # Remove common AI "thinking" patterns
+                            # Remove common AI "thinking" patterns and technical details
                             thinking_patterns = [
                                 "I'm an AI assistant",
                                 "As an AI",
@@ -4523,9 +4523,27 @@ async def on_message(message):
                                 "Looking at the",
                                 "=== REFERENCED MESSAGE",
                                 "=== RECENT CHAT CONTEXT",
+                                "=== MESSAGE BEING ASKED ABOUT",
+                                "=== RECENT CONVERSATION",
                                 "Your role:",
-                                "Answer the user's question"
+                                "Answer the user's question",
+                                "the user with the ID",
+                                "the message from",
+                                "addressed to the user",
+                                "user ID",
+                                "message ID",
+                                "says \"",
+                                "and is addressed",
+                                "was the last message sent by"
                             ]
+                            
+                            # Remove user IDs and technical references (re is already imported at top)
+                            cleaned_response = re.sub(r'\b\d{17,19}\b', '', cleaned_response)  # Remove Discord IDs (17-19 digits)
+                            cleaned_response = re.sub(r'user ID \d+', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'message ID \d+', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'addressed to the user', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'the user with the ID', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'\s+', ' ', cleaned_response).strip()  # Clean up extra spaces
                             
                             # Split into lines and filter out thinking patterns
                             lines = cleaned_response.split('\n')

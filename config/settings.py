@@ -47,8 +47,8 @@ class Settings:
     
     # AI Assistant
     AI_ENABLED: bool = os.getenv("AI_ENABLED", "true").lower() == "true"
-    AI_API_KEY: str = os.getenv("OPENAI_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
-    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "openai").lower()  # openai, groq, anthropic
+    AI_API_KEY: str = os.getenv("GROQ_API_KEY", "") or os.getenv("OPENAI_API_KEY", "") or os.getenv("ANTHROPIC_API_KEY", "")
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "groq").lower()  # openai, groq, anthropic (default to groq)
     AI_MODEL: str = os.getenv("AI_MODEL", "")  # Optional: override default model
     
     # Data files

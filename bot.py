@@ -1278,16 +1278,27 @@ async def on_ready():
     # Initialize AI Assistant
     if settings.AI_ENABLED:
         try:
-            if settings.AI_API_KEY:
+            # Try to get API key from settings or directly from env
+            api_key = settings.AI_API_KEY
+            if not api_key:
+                # Fallback: check env directly
+                api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+            
+            if api_key:
                 bot.ai_assistant = AIAssistant(
-                    api_key=settings.AI_API_KEY,
+                    api_key=api_key,
                     api_provider=settings.AI_PROVIDER
                 )
                 logger.info(f"✅ AI Assistant initialized (Provider: {settings.AI_PROVIDER})")
+                logger.info(f"✅ API Key found: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
             else:
-                logger.warning("⚠️ AI_ENABLED is true but no API key found. Set OPENAI_API_KEY or GROQ_API_KEY in .env")
+                logger.warning("⚠️ AI_ENABLED is true but no API key found.")
+                logger.warning("⚠️ Set GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY in .env")
+                logger.warning(f"⚠️ Current AI_PROVIDER setting: {settings.AI_PROVIDER}")
         except Exception as e:
             logger.error(f"Error initializing AI Assistant: {e}", exc_info=True)
+            import traceback
+            logger.error(traceback.format_exc())
 
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"

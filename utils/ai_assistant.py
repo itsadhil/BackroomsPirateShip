@@ -65,10 +65,27 @@ class AIAssistant:
     """AI Assistant that answers questions about chat context."""
     
     def __init__(self, api_key: Optional[str] = None, api_provider: str = "openai"):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+        # Use provided API key, or try to get from environment
+        if api_key:
+            self.api_key = api_key
+        else:
+            # Try provider-specific key first, then fallback
+            if api_provider.lower() == "groq":
+                self.api_key = os.getenv("GROQ_API_KEY", "")
+            elif api_provider.lower() == "openai":
+                self.api_key = os.getenv("OPENAI_API_KEY", "")
+            elif api_provider.lower() == "anthropic":
+                self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            else:
+                # Fallback: try all
+                self.api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY", "")
+        
         self.api_provider = api_provider.lower()
         self.base_url = self._get_base_url()
         self.model = self._get_model()
+        
+        if not self.api_key:
+            logger.warning(f"No API key found for provider: {api_provider}")
         
     def _get_base_url(self) -> str:
         """Get API base URL based on provider."""

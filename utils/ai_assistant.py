@@ -101,7 +101,9 @@ class AIAssistant:
     def _get_model(self) -> str:
         """Get model name based on provider."""
         if self.api_provider == "groq":
-            return os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+            # Updated to current Groq models (as of 2025)
+            # Available: llama-3.3-70b-versatile, llama-3.1-8b-instant, llama-3.1-70b-versatile, mixtral-8x7b-32768
+            return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         elif self.api_provider == "openai":
             return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         elif self.api_provider == "anthropic":

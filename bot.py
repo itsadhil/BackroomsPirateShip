@@ -4423,10 +4423,24 @@ async def on_message(message):
         try:
             # Extract question (remove mention)
             question = message.content
-            # Remove bot mention
-            for mention in message.mentions:
-                question = question.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-            question = question.strip()
+            if not question:
+                return  # No content, skip
+            
+            # Remove bot mention (handle both formats)
+            bot_mention_patterns = [
+                f"<@{bot.user.id}>",
+                f"<@!{bot.user.id}>",
+                bot.user.mention
+            ]
+            for pattern in bot_mention_patterns:
+                question = question.replace(pattern, "")
+            
+            # Clean up extra whitespace
+            question = " ".join(question.split()).strip()
+            
+            # If question is empty after removing mention, use a default
+            if not question:
+                question = "What's happening in this channel?"
             
             if question:
                 # Show typing indicator
@@ -4436,23 +4450,27 @@ async def on_message(message):
                     
                     # Check if this is a reply to another message
                     referenced_message = None
-                    if message.reference:
-                        try:
+                    try:
+                        if message.reference and message.reference.message_id:
                             # Try to get the referenced message
-                            if message.reference.resolved:
+                            if hasattr(message.reference, 'resolved') and message.reference.resolved:
                                 referenced_message = message.reference.resolved
-                            elif message.reference.message_id:
+                            else:
                                 # Fetch the message if not cached
                                 try:
                                     referenced_message = await message.channel.fetch_message(message.reference.message_id)
-                                except discord.NotFound:
-                                    logger.warning(f"Referenced message {message.reference.message_id} not found")
-                                except discord.Forbidden:
-                                    logger.warning(f"No permission to fetch referenced message")
+                                except (discord.NotFound, discord.HTTPException) as e:
+                                    logger.debug(f"Could not fetch referenced message {message.reference.message_id}: {e}")
+                                    referenced_message = None
                                 except Exception as e:
-                                    logger.warning(f"Error fetching referenced message: {e}")
-                        except Exception as e:
-                            logger.warning(f"Error handling message reference: {e}")
+                                    logger.warning(f"Unexpected error fetching referenced message: {e}")
+                                    referenced_message = None
+                    except AttributeError:
+                        # message.reference might not exist or be None
+                        referenced_message = None
+                    except Exception as e:
+                        logger.warning(f"Error handling message reference: {e}")
+                        referenced_message = None
                     
                     # Build context with referenced message if available
                     if referenced_message and isinstance(referenced_message, discord.Message):
@@ -4493,9 +4511,50 @@ async def on_message(message):
                         )
                         
                         if response:
+                            # Clean response - remove any system prompt leakage or thinking
+                            cleaned_response = response.strip()
+                            
+                            # Remove common AI "thinking" patterns
+                            thinking_patterns = [
+                                "I'm an AI assistant",
+                                "As an AI",
+                                "I can see",
+                                "Based on the context",
+                                "Looking at the",
+                                "=== REFERENCED MESSAGE",
+                                "=== RECENT CHAT CONTEXT",
+                                "Your role:",
+                                "Answer the user's question"
+                            ]
+                            
+                            # Split into lines and filter out thinking patterns
+                            lines = cleaned_response.split('\n')
+                            filtered_lines = []
+                            skip_next = False
+                            
+                            for line in lines:
+                                line_lower = line.lower().strip()
+                                # Skip lines that look like system prompts or thinking
+                                if any(pattern.lower() in line_lower for pattern in thinking_patterns):
+                                    continue
+                                # Skip empty lines at start
+                                if not filtered_lines and not line.strip():
+                                    continue
+                                filtered_lines.append(line)
+                            
+                            cleaned_response = '\n'.join(filtered_lines).strip()
+                            
+                            # If we filtered everything, use original (but truncated)
+                            if not cleaned_response:
+                                cleaned_response = response[:500].strip()
+                            
+                            # Limit response length
+                            if len(cleaned_response) > 2000:
+                                cleaned_response = cleaned_response[:1950] + "..."
+                            
                             # Send response
                             embed = discord.Embed(
-                                description=response,
+                                description=cleaned_response,
                                 color=discord.Color.blue()
                             )
                             embed.set_footer(text=f"Asked by {message.author.display_name}")
@@ -4504,10 +4563,18 @@ async def on_message(message):
                             await message.reply("❌ Sorry, I couldn't generate a response. Make sure your AI API key is configured correctly.")
                     else:
                         await message.reply("❌ AI Assistant is not initialized. Check your API key configuration.")
+        except discord.errors.HTTPException as e:
+            logger.error(f"Discord HTTP error handling AI question: {e}")
+            try:
+                await message.channel.send(f"❌ Error: {str(e)[:100]}")
+            except:
+                pass
         except Exception as e:
             logger.error(f"Error handling AI question: {e}", exc_info=True)
+            import traceback
+            logger.error(traceback.format_exc())
             try:
-                await message.reply("❌ Sorry, I encountered an error processing your question.")
+                await message.channel.send("❌ Sorry, I encountered an error processing your question. Check logs for details.")
             except:
                 pass
     

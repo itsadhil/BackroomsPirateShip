@@ -125,37 +125,25 @@ class AIAssistant:
             return None
         
         try:
-            # Build system prompt
+            # Build system prompt - keep it concise to avoid leakage
             if is_reply:
-                system_prompt = f"""You are a helpful AI assistant in a Discord server called "{server_name}". 
-A user has replied to a specific message and asked you a question about it.
+                system_prompt = f"""You are a helpful Discord bot assistant. A user replied to a message and asked about it.
 
-Your role:
-- Focus on the REFERENCED MESSAGE (the one being replied to) when answering
-- Use the recent chat context to understand the conversation flow
-- Explain what the referenced message means or provide context about it
-- Be concise and friendly
-- If the question is unclear, ask for clarification
+Focus on the REFERENCED MESSAGE section when answering. Be concise and direct.
 
-Chat context (includes the referenced message):
+Context:
 {context}
 
-The user is asking about the REFERENCED MESSAGE specifically. Answer their question based on that message and the surrounding context."""
+Answer the question about the referenced message. Do not repeat the context or explain your role."""
             else:
-                system_prompt = f"""You are a helpful AI assistant in a Discord server called "{server_name}". 
-You can see recent messages from the #{channel_name} channel and answer questions about what's happening in the conversation.
+                system_prompt = f"""You are a helpful Discord bot assistant in #{channel_name}. Answer questions about recent chat activity.
 
-Your role:
-- Answer questions about recent chat activity
-- Summarize what people are discussing
-- Help users understand context they might have missed
-- Be concise and friendly
-- If you don't have enough context, say so
+Be concise and direct. Do not explain your role or repeat the context.
 
-Recent chat context:
+Recent messages:
 {context}
 
-Answer the user's question based on the context above. Be helpful and concise."""
+Answer the user's question based on the messages above."""
 
             # Prepare API request
             if self.api_provider == "anthropic":

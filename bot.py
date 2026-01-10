@@ -4433,7 +4433,54 @@ async def on_message(message):
                 async with message.channel.typing():
                     # Get chat context
                     context = get_chat_context(message.channel.id)
-                    context_text = context.format_context(limit=20)
+                    
+                    # Check if this is a reply to another message
+                    referenced_message = None
+                    if message.reference:
+                        try:
+                            # Try to get the referenced message
+                            if message.reference.resolved:
+                                referenced_message = message.reference.resolved
+                            elif message.reference.message_id:
+                                # Fetch the message if not cached
+                                try:
+                                    referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                                except discord.NotFound:
+                                    logger.warning(f"Referenced message {message.reference.message_id} not found")
+                                except discord.Forbidden:
+                                    logger.warning(f"No permission to fetch referenced message")
+                                except Exception as e:
+                                    logger.warning(f"Error fetching referenced message: {e}")
+                        except Exception as e:
+                            logger.warning(f"Error handling message reference: {e}")
+                    
+                    # Build context with referenced message if available
+                    if referenced_message and isinstance(referenced_message, discord.Message):
+                        # Include the referenced message prominently in context
+                        ref_author = referenced_message.author.display_name or referenced_message.author.name
+                        ref_content = referenced_message.content
+                        ref_time = referenced_message.created_at.strftime("%H:%M")
+                        
+                        # Add referenced message to context if not already there
+                        context.add_message(
+                            author=ref_author,
+                            content=ref_content,
+                            timestamp=referenced_message.created_at,
+                            attachments=[att.url for att in referenced_message.attachments] if referenced_message.attachments else []
+                        )
+                        
+                        # Format context with highlighted referenced message
+                        context_text = f"=== REFERENCED MESSAGE (the one being asked about) ===\n"
+                        context_text += f"[{ref_time}] {ref_author}: {ref_content}\n"
+                        context_text += f"=== RECENT CHAT CONTEXT ===\n"
+                        context_text += context.format_context(limit=15)
+                        
+                        # Update question to indicate it's about the referenced message
+                        if not question.lower().startswith(("what", "explain", "why", "how", "who", "when", "where")):
+                            question = f"About this message: '{ref_content[:100]}' - {question}"
+                    else:
+                        # Normal context without reply
+                        context_text = context.format_context(limit=20)
                     
                     # Get AI response
                     if bot.ai_assistant:
@@ -4441,7 +4488,8 @@ async def on_message(message):
                             question=question,
                             context=context_text,
                             channel_name=message.channel.name,
-                            server_name=message.guild.name if message.guild else "Discord Server"
+                            server_name=message.guild.name if message.guild else "Discord Server",
+                            is_reply=referenced_message is not None
                         )
                         
                         if response:

@@ -116,7 +116,8 @@ class AIAssistant:
         question: str, 
         context: str,
         channel_name: str = "general",
-        server_name: str = "Discord Server"
+        server_name: str = "Discord Server",
+        is_reply: bool = False
     ) -> Optional[str]:
         """Ask the AI a question with chat context."""
         if not self.api_key:
@@ -125,7 +126,23 @@ class AIAssistant:
         
         try:
             # Build system prompt
-            system_prompt = f"""You are a helpful AI assistant in a Discord server called "{server_name}". 
+            if is_reply:
+                system_prompt = f"""You are a helpful AI assistant in a Discord server called "{server_name}". 
+A user has replied to a specific message and asked you a question about it.
+
+Your role:
+- Focus on the REFERENCED MESSAGE (the one being replied to) when answering
+- Use the recent chat context to understand the conversation flow
+- Explain what the referenced message means or provide context about it
+- Be concise and friendly
+- If the question is unclear, ask for clarification
+
+Chat context (includes the referenced message):
+{context}
+
+The user is asking about the REFERENCED MESSAGE specifically. Answer their question based on that message and the surrounding context."""
+            else:
+                system_prompt = f"""You are a helpful AI assistant in a Discord server called "{server_name}". 
 You can see recent messages from the #{channel_name} channel and answer questions about what's happening in the conversation.
 
 Your role:

@@ -15,8 +15,8 @@ async def retry_async(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     exceptions: Tuple[Exception, ...] = (Exception,),
-    *args,
-    **kwargs
+    *func_args,
+    **func_kwargs
 ) -> T:
     """
     Retry an async function with exponential backoff.
@@ -40,7 +40,7 @@ async def retry_async(
     
     for attempt in range(1, max_attempts + 1):
         try:
-            return await func(*args, **kwargs)
+            return await func(*func_args, **func_kwargs)
         except exceptions as e:
             last_exception = e
             if attempt < max_attempts:
@@ -69,6 +69,7 @@ def retry(
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            # Call retry_async with retry parameters as keyword args, then function args/kwargs
             return await retry_async(
                 func,
                 max_attempts=max_attempts,

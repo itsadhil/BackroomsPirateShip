@@ -54,5 +54,5 @@ debug_*.html
 # Documentation files
 *.md
 
-# Cogs (if you want to keep them local for now)
-cogs/
+# Keep cogs in repo (monitoring, instagram) - remove line below if you want to ignore cogs
+# cogs/

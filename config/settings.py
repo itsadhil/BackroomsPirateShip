@@ -45,6 +45,11 @@ class Settings:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
     
+    # Instagram Reels (optional integration)
+    INSTAGRAM_DATA_DIR: str = os.getenv("INSTAGRAM_DATA_DIR", "data/instagram")
+    INSTAGRAM_USERNAME: str = os.getenv("INSTAGRAM_USERNAME", "")
+    INSTAGRAM_PASSWORD: str = os.getenv("INSTAGRAM_PASSWORD", "")
+
     # Data files
     DATA_DIR: Path = Path("data")
     RSS_SEEN_FILE: Path = DATA_DIR / "fitgirl_seen_posts.json"

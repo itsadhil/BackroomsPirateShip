@@ -8,3 +8,9 @@ flask
 python3-openid
 requests
 psutil
+# Instagram Reels integration
+instagrapi>=1.19.0
+moviepy>=1.0.3
+google-api-python-client>=2.86.0
+yt-dlp>=2023.7.6
+SQLAlchemy>=2.0.0

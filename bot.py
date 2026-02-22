@@ -8296,6 +8296,11 @@ async def load_cogs():
         print("✅ Monitoring cog loaded")
     except Exception as e:
         print(f"⚠️ Failed to load monitoring cog: {e}")
+    try:
+        await bot.load_extension('cogs.instagram')
+        print("✅ Instagram Reels cog loaded")
+    except Exception as e:
+        print(f"⚠️ Failed to load Instagram cog: {e}")
 
 @bot.event
 async def setup_hook():

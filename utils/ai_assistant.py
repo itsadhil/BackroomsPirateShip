@@ -1,0 +1,247 @@
+"""
+AI Assistant for Discord - Context-aware chat assistant similar to Groq.
+Tracks chat context and answers questions about what's happening in the conversation.
+"""
+
+import logging
+import os
+from typing import List, Dict, Optional
+import aiohttp
+import json
+from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
+
+class ChatContext:
+    """Manages chat context for a channel."""
+    
+    def __init__(self, max_messages: int = 50, max_age_hours: int = 24):
+        self.max_messages = max_messages
+        self.max_age_hours = max_age_hours
+        self.messages: List[Dict] = []
+    
+    def add_message(self, author: str, content: str, timestamp: datetime, attachments: List[str] = None):
+        """Add a message to context."""
+        # Ensure timestamp is timezone-aware
+        if timestamp.tzinfo is None:
+            # Assume UTC if naive
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        
+        # Remove old messages (ensure cutoff_time is also timezone-aware)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.max_age_hours)
+        filtered_messages = []
+        for msg in self.messages:
+            msg_timestamp = msg['timestamp']
+            # Ensure message timestamp is timezone-aware
+            if msg_timestamp.tzinfo is None:
+                msg_timestamp = msg_timestamp.replace(tzinfo=timezone.utc)
+            if msg_timestamp > cutoff_time:
+                filtered_messages.append(msg)
+        self.messages = filtered_messages
+        
+        # Add new message
+        self.messages.append({
+            'author': author,
+            'content': content,
+            'timestamp': timestamp,
+            'attachments': attachments or []
+        })
+        
+        # Keep only recent messages
+        if len(self.messages) > self.max_messages:
+            self.messages = self.messages[-self.max_messages:]
+    
+    def get_recent_context(self, limit: int = 20) -> List[Dict]:
+        """Get recent messages for context."""
+        return self.messages[-limit:]
+    
+    def format_context(self, limit: int = 20) -> str:
+        """Format recent messages as a readable context string."""
+        recent = self.get_recent_context(limit)
+        if not recent:
+            return "No recent messages in this channel."
+        
+        lines = []
+        for msg in recent:
+            # Handle timezone-aware and naive timestamps
+            ts = msg['timestamp']
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            timestamp = ts.strftime("%H:%M")
+            author = msg['author']
+            content = msg['content'][:200]  # Truncate long messages
+            lines.append(f"[{timestamp}] {author}: {content}")
+        
+        return "\n".join(lines)
+
+
+class AIAssistant:
+    """AI Assistant that answers questions about chat context."""
+    
+    def __init__(self, api_key: Optional[str] = None, api_provider: str = "openai"):
+        # Use provided API key, or try to get from environment
+        if api_key:
+            self.api_key = api_key
+        else:
+            # Try provider-specific key first, then fallback
+            if api_provider.lower() == "groq":
+                self.api_key = os.getenv("GROQ_API_KEY", "")
+            elif api_provider.lower() == "openai":
+                self.api_key = os.getenv("OPENAI_API_KEY", "")
+            elif api_provider.lower() == "anthropic":
+                self.api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            else:
+                # Fallback: try all
+                self.api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY", "")
+        
+        self.api_provider = api_provider.lower()
+        self.base_url = self._get_base_url()
+        self.model = self._get_model()
+        
+        if not self.api_key:
+            logger.warning(f"No API key found for provider: {api_provider}")
+        
+    def _get_base_url(self) -> str:
+        """Get API base URL based on provider."""
+        if self.api_provider == "groq":
+            return "https://api.groq.com/openai/v1"
+        elif self.api_provider == "openai":
+            return "https://api.openai.com/v1"
+        elif self.api_provider == "anthropic":
+            return "https://api.anthropic.com/v1"
+        else:
+            return "https://api.openai.com/v1"  # Default to OpenAI
+    
+    def _get_model(self) -> str:
+        """Get model name based on provider."""
+        if self.api_provider == "groq":
+            # Updated to current Groq models (as of 2025)
+            # Available: llama-3.3-70b-versatile, llama-3.1-8b-instant, llama-3.1-70b-versatile, mixtral-8x7b-32768
+            return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        elif self.api_provider == "openai":
+            return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        elif self.api_provider == "anthropic":
+            return os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
+        else:
+            return "gpt-4o-mini"
+    
+    async def ask_question(
+        self, 
+        question: str, 
+        context: str,
+        channel_name: str = "general",
+        server_name: str = "Discord Server",
+        is_reply: bool = False
+    ) -> Optional[str]:
+        """Ask the AI a question with chat context."""
+        if not self.api_key:
+            logger.warning("No API key configured for AI assistant")
+            return None
+        
+        try:
+            # Build system prompt - keep it concise to avoid leakage
+            if is_reply:
+                system_prompt = f"""You are a helpful Discord bot. A user replied to a message and asked you about it.
+
+IMPORTANT RULES:
+- Answer naturally and conversationally, like a friend explaining something
+- Focus on the MESSAGE BEING ASKED ABOUT section
+- Do NOT mention user IDs, message IDs, or technical details
+- Do NOT say things like "the message says" or "the user with ID"
+- Just explain what the message means or answer the question directly
+- Be brief and helpful
+
+Context:
+{context}
+
+Answer the question naturally about the message being asked about."""
+            else:
+                system_prompt = f"""You are a helpful Discord bot in #{channel_name}. Answer questions about what's happening in the chat.
+
+IMPORTANT RULES:
+- Answer naturally and conversationally
+- Do NOT mention user IDs, message IDs, timestamps, or technical details
+- Do NOT say "the message from [user] says" - just explain naturally
+- Summarize conversations in a friendly way
+- Be brief and helpful
+
+Recent messages:
+{context}
+
+Answer the user's question naturally based on the conversation above."""
+
+            # Prepare API request
+            if self.api_provider == "anthropic":
+                return await self._call_anthropic(system_prompt, question)
+            else:
+                return await self._call_openai_compatible(system_prompt, question)
+                
+        except Exception as e:
+            logger.error(f"Error calling AI API: {e}", exc_info=True)
+            return None
+    
+    async def _call_openai_compatible(self, system_prompt: str, question: str) -> Optional[str]:
+        """Call OpenAI-compatible API (OpenAI, Groq, etc.)."""
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                else:
+                    error_text = await response.text()
+                    logger.error(f"API error {response.status}: {error_text}")
+                    return None
+    
+    async def _call_anthropic(self, system_prompt: str, question: str) -> Optional[str]:
+        """Call Anthropic Claude API."""
+        url = f"{self.base_url}/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.model,
+            "max_tokens": 500,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": question}
+            ]
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("content", [{}])[0].get("text", "").strip()
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Anthropic API error {response.status}: {error_text}")
+                    return None
+
+
+# Global chat context storage
+chat_contexts: Dict[int, ChatContext] = {}  # channel_id -> ChatContext
+
+def get_chat_context(channel_id: int) -> ChatContext:
+    """Get or create chat context for a channel."""
+    if channel_id not in chat_contexts:
+        chat_contexts[channel_id] = ChatContext()
+    return chat_contexts[channel_id]

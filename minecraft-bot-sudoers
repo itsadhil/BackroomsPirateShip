@@ -1,0 +1,3 @@
+# Allow bot user to manage Minecraft Bedrock service without password
+ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl start minecraft-bedrock, /bin/systemctl stop minecraft-bedrock, /bin/systemctl restart minecraft-bedrock, /bin/systemctl status minecraft-bedrock
+

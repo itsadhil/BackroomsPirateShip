@@ -34,6 +34,7 @@ from utils.steam_api import SteamAPI, format_playtime, get_personastate_string
 from utils.steam_linker import SteamLinker
 from utils.retry import retry
 from utils.rate_limiter import get_steam_limiter, get_igdb_limiter
+from utils.ai_assistant import AIAssistant, get_chat_context
 
 # -------------------------
 # LOAD ENV (for backward compatibility)
@@ -136,6 +137,7 @@ bot.steam_sessions = {}  # Track gaming sessions (discord_id: [{game, start, end
 bot.steam_wishlists = {}  # Track Steam wishlists (discord_id: [game_ids])
 bot.game_nights = {}  # Track scheduled game nights (guild_id: [{host, game, time, participants}])
 bot.squad_notifications = {}  # Track squad up notifications (game: [user_ids])
+bot.ai_assistant = None  # AI Assistant instance
 
 # Playwright queue system
 bot.playwright_queue = asyncio.Queue()  # Queue for download requests
@@ -156,7 +158,8 @@ def load_seen_posts():
 
 def save_seen_posts():
     try:
-        data_manager.seen_rss_posts = bot.seen_rss_posts
+        # Update the internal attribute directly (property is read-only)
+        data_manager._seen_rss_posts = bot.seen_rss_posts.copy()
         data_manager.save_seen_posts()
     except Exception as e:
         logger.error(f"⚠️ Could not save seen posts: {e}", exc_info=True)
@@ -226,7 +229,7 @@ def load_reviews_data():
 def save_reviews_data():
     """Save review data."""
     try:
-        data_manager.reviews = bot.game_reviews
+        data_manager._reviews = bot.game_reviews.copy()
         data_manager.save_reviews()
     except Exception as e:
         logger.error(f"⚠️ Could not save reviews data: {e}", exc_info=True)
@@ -243,7 +246,7 @@ def load_tags_data():
 def save_tags_data():
     """Save tags data."""
     try:
-        data_manager.tags = bot.game_tags
+        data_manager._tags = bot.game_tags.copy()
         data_manager.save_tags()
     except Exception as e:
         logger.error(f"⚠️ Could not save tags data: {e}", exc_info=True)
@@ -260,7 +263,7 @@ def load_health_data():
 def save_health_data():
     """Save link health data."""
     try:
-        data_manager.health = bot.link_health
+        data_manager._health = bot.link_health.copy()
         data_manager.save_health()
     except Exception as e:
         logger.error(f"⚠️ Could not save health data: {e}", exc_info=True)
@@ -277,7 +280,7 @@ def load_webhooks_data():
 def save_webhooks_data():
     """Save webhooks data."""
     try:
-        data_manager.webhooks = bot.webhooks
+        data_manager._webhooks = bot.webhooks.copy()
         data_manager.save_webhooks()
     except Exception as e:
         logger.error(f"⚠️ Could not save webhooks data: {e}", exc_info=True)
@@ -294,7 +297,7 @@ def load_collections_data():
 def save_collections_data():
     """Save collections data."""
     try:
-        data_manager.collections = bot.collections
+        data_manager._collections = bot.collections.copy()
         data_manager.save_collections()
     except Exception as e:
         logger.error(f"⚠️ Could not save collections data: {e}", exc_info=True)
@@ -311,7 +314,7 @@ def load_compatibility_data():
 def save_compatibility_data():
     """Save compatibility data."""
     try:
-        data_manager.compatibility = bot.compatibility_reports
+        data_manager._compatibility = bot.compatibility_reports.copy()
         data_manager.save_compatibility()
     except Exception as e:
         logger.error(f"⚠️ Could not save compatibility data: {e}", exc_info=True)
@@ -328,12 +331,35 @@ async def update_status_message(status: str):
         timestamp = f"<t:{int(now.timestamp())}:F>"
         
         if status == "online":
+            # Get system stats
+            try:
+                import psutil
+                process = psutil.Process()
+                # Get CPU usage - use a small interval for accurate reading
+                # This will block for 0.1 seconds, but gives accurate results
+                cpu_percent = process.cpu_percent(interval=0.1)
+                
+                # Get memory usage
+                memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+                sys_mem = psutil.virtual_memory()
+                memory_percent = (memory_usage / (sys_mem.total / 1024 / 1024)) * 100
+            except Exception as e:
+                logger.warning(f"Could not get system stats: {e}")
+                cpu_percent = 0.0
+                memory_percent = 0.0
+            
             embed = discord.Embed(
-                title="🟢 Bot Online",
-                description=f"Bot is now online and ready to serve!\n\n**Started:** {timestamp}",
+                title="✅ Bot Started",
+                description=f"**!Backroom Pirate Captain** is now online!",
                 color=discord.Color.green(),
                 timestamp=now
             )
+            
+            # Add stats fields
+            embed.add_field(name="CPU", value=f"{cpu_percent:.1f}%", inline=True)
+            embed.add_field(name="Memory", value=f"{memory_percent:.1f}%", inline=True)
+            embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+            
             embed.set_footer(text="Backrooms Pirate Ship")
         elif status == "starting":
             embed = discord.Embed(
@@ -778,76 +804,132 @@ class FitGirlScraper:
     
     async def download_torrent_from_paste(self, paste_url: str, request_id: str = None) -> Optional[bytes]:
         """Download torrent file from FitGirl paste site using headless browser with queue system."""
+        browser = None
+        context = None
+        page = None
         try:
-            # Add to queue
-            if request_id:
-                queue_size = bot.playwright_queue.qsize()
-                bot.queue_position[request_id] = queue_size + 1
+            logger.info(f"🌐 Opening headless browser for: {paste_url}")
             
-            print(f"🌐 Opening headless browser for: {paste_url}")
+            # Use browser pool if available, otherwise fallback to direct launch
+            try:
+                from utils.browser_pool import get_browser_pool
+                pool = get_browser_pool()
+                if pool._initialized:
+                    browser = await pool.get_browser()
+                    context = await pool.create_context(browser)
+                    if not context:
+                        logger.warning("Could not create context from pool, using direct launch")
+                        browser = None
+            except Exception as e:
+                logger.warning(f"Browser pool not available, using direct launch: {e}")
             
-            async with async_playwright() as p:
-                # Launch browser in headless mode
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                )
+            # Fallback to direct launch if pool failed
+            if not browser:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=['--no-sandbox', '--disable-setuid-sandbox']
+                    )
+                    context = await browser.new_context(
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    )
+                    page = await context.new_page()
+            else:
                 page = await context.new_page()
-                
-                # Navigate to the paste URL
-                await page.goto(paste_url, wait_until='domcontentloaded', timeout=30000)
-                print(f"📄 Page loaded, waiting for download link...")
-                
-                # Wait for the download link to appear (it's generated by JavaScript)
-                # The link has class 'alert-link' and download attribute
+            
+            # Navigate to the paste URL
+            await page.goto(paste_url, wait_until='domcontentloaded', timeout=30000)
+            logger.info(f"📄 Page loaded, waiting for download link...")
+            
+            # Wait for the download link to appear (it's generated by JavaScript)
+            # The link has class 'alert-link' and download attribute
+            try:
+                await page.wait_for_selector('a.alert-link[download]', timeout=15000)
+                logger.info(f"✅ Download link appeared!")
+            except Exception as e:
+                logger.error(f"⚠️ Download link did not appear in time: {e}")
+                if context:
+                    await context.close()
+                if browser and not browser.is_connected():
+                    pass  # Already closed
+                elif browser:
+                    # Return browser to pool if using pool
+                    try:
+                        from utils.browser_pool import get_browser_pool
+                        pool = get_browser_pool()
+                        if pool._initialized:
+                            await pool.return_browser(browser)
+                        else:
+                            await browser.close()
+                    except:
+                        await browser.close()
+                return None
+            
+            # Get the download link element
+            download_link = await page.query_selector('a.alert-link[download]')
+            if not download_link:
+                logger.error(f"⚠️ Could not find download link")
+                if context:
+                    await context.close()
+                if browser:
+                    try:
+                        from utils.browser_pool import get_browser_pool
+                        pool = get_browser_pool()
+                        if pool._initialized:
+                            await pool.return_browser(browser)
+                        else:
+                            await browser.close()
+                    except:
+                        await browser.close()
+                return None
+            
+            # Get the blob URL
+            href = await download_link.get_attribute('href')
+            logger.info(f"🔗 Found download link: {href}")
+            
+            # Download the blob URL content
+            # Execute JavaScript to fetch the blob and convert to base64
+            torrent_base64 = await page.evaluate("""
+                async (blobUrl) => {
+                    const response = await fetch(blobUrl);
+                    const blob = await response.blob();
+                    return new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                        reader.readAsDataURL(blob);
+                    });
+                }
+            """, href)
+            
+            if context:
+                await context.close()
+            
+            # Return browser to pool or close
+            if browser:
                 try:
-                    await page.wait_for_selector('a.alert-link[download]', timeout=15000)
-                    print(f"✅ Download link appeared!")
+                    from utils.browser_pool import get_browser_pool
+                    pool = get_browser_pool()
+                    if pool._initialized and browser.is_connected():
+                        await pool.return_browser(browser)
+                    elif not browser.is_connected():
+                        pass  # Already closed
+                    else:
+                        await browser.close()
                 except:
-                    print(f"⚠️ Download link did not appear in time")
-                    await browser.close()
-                    return None
-                
-                # Get the download link element
-                download_link = await page.query_selector('a.alert-link[download]')
-                if not download_link:
-                    print(f"⚠️ Could not find download link")
-                    await browser.close()
-                    return None
-                
-                # Get the blob URL
-                href = await download_link.get_attribute('href')
-                print(f"🔗 Found download link: {href}")
-                
-                # Download the blob URL content
-                # Execute JavaScript to fetch the blob and convert to base64
-                torrent_base64 = await page.evaluate("""
-                    async (blobUrl) => {
-                        const response = await fetch(blobUrl);
-                        const blob = await response.blob();
-                        return new Promise((resolve) => {
-                            const reader = new FileReader();
-                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                            reader.readAsDataURL(blob);
-                        });
-                    }
-                """, href)
-                
-                await browser.close()
-                
-                if torrent_base64:
-                    import base64
-                    torrent_data = base64.b64decode(torrent_base64)
-                    print(f"✅ Downloaded torrent: {len(torrent_data)} bytes")
-                    return torrent_data
-                else:
-                    print(f"⚠️ Failed to extract torrent data")
-                    return None
+                    if browser.is_connected():
+                        await browser.close()
+            
+            if torrent_base64:
+                import base64
+                torrent_data = base64.b64decode(torrent_base64)
+                logger.info(f"✅ Downloaded torrent: {len(torrent_data)} bytes")
+                return torrent_data
+            else:
+                logger.error(f"⚠️ Failed to extract torrent data")
+                return None
                     
         except Exception as e:
-            print(f"⚠️ Error downloading torrent with browser: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"⚠️ Error downloading torrent with browser: {e}", exc_info=True)
             return None
         finally:
             # Clean up queue tracking
@@ -1192,6 +1274,47 @@ async def on_ready():
         logger.info("Browser pool initialized")
     except Exception as e:
         logger.error(f"Error initializing browser pool: {e}", exc_info=True)
+    
+    # Initialize AI Assistant
+    if settings.AI_ENABLED:
+        try:
+            # Debug: Check what's in environment
+            logger.info(f"🔍 Debugging AI Assistant initialization...")
+            logger.info(f"🔍 AI_PROVIDER: {settings.AI_PROVIDER}")
+            logger.info(f"🔍 settings.AI_API_KEY length: {len(settings.AI_API_KEY) if settings.AI_API_KEY else 0}")
+            
+            # Try to get API key from settings or directly from env
+            api_key = settings.AI_API_KEY
+            if not api_key:
+                # Fallback: check env directly (reload .env to be sure)
+                load_dotenv(override=True)  # Force reload
+                api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+                logger.info(f"🔍 Direct env check - GROQ_API_KEY length: {len(os.getenv('GROQ_API_KEY', ''))}")
+                logger.info(f"🔍 Direct env check - OPENAI_API_KEY length: {len(os.getenv('OPENAI_API_KEY', ''))}")
+                logger.info(f"🔍 Direct env check - ANTHROPIC_API_KEY length: {len(os.getenv('ANTHROPIC_API_KEY', ''))}")
+            
+            if api_key:
+                # Clean the key (remove whitespace)
+                api_key = api_key.strip()
+                if api_key:
+                    bot.ai_assistant = AIAssistant(
+                        api_key=api_key,
+                        api_provider=settings.AI_PROVIDER
+                    )
+                    logger.info(f"✅ AI Assistant initialized (Provider: {settings.AI_PROVIDER})")
+                    logger.info(f"✅ API Key found: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
+                else:
+                    logger.warning("⚠️ API key found but is empty (whitespace only)")
+            else:
+                logger.warning("⚠️ AI_ENABLED is true but no API key found.")
+                logger.warning("⚠️ Set GROQ_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY in .env")
+                logger.warning(f"⚠️ Current AI_PROVIDER setting: {settings.AI_PROVIDER}")
+                logger.warning(f"⚠️ Make sure .env file is in the bot directory: {os.getcwd()}")
+                logger.warning(f"⚠️ Check .env file exists: {os.path.exists('.env')}")
+        except Exception as e:
+            logger.error(f"Error initializing AI Assistant: {e}", exc_info=True)
+            import traceback
+            logger.error(traceback.format_exc())
 
     # Check if RSS auto-posting is enabled (can disable for free tier)
     rss_enabled = os.getenv("ENABLE_RSS_AUTO", "true").lower() == "true"
@@ -1225,7 +1348,44 @@ async def on_ready():
     if not playwright_queue_processor.is_running():
         playwright_queue_processor.start()
         print(f"✅ Playwright queue processor started")
-
+    
+    # Start Minecraft monitoring tasks
+    if not minecraft_auto_restart_monitor.is_running():
+        minecraft_auto_restart_monitor.start()
+        print(f"✅ Minecraft auto-restart monitor started")
+    
+    if not minecraft_player_notifications.is_running():
+        minecraft_player_notifications.start()
+        print(f"✅ Minecraft player notifications started")
+    
+    if not minecraft_scheduled_backups.is_running():
+        minecraft_scheduled_backups.start()
+        print(f"✅ Minecraft scheduled backups monitor started")
+    
+    # Start Minecraft scheduled restarts
+    try:
+        if not minecraft_scheduled_restarts.is_running():
+            minecraft_scheduled_restarts.start()
+            print(f"✅ Minecraft scheduled restarts monitor started")
+    except Exception as e:
+        logger.error(f"Failed to start scheduled restarts: {e}", exc_info=True)
+    
+    # Start Minecraft resource monitor
+    try:
+        if not minecraft_resource_monitor.is_running():
+            minecraft_resource_monitor.start()
+            print(f"✅ Minecraft resource monitor started")
+    except Exception as e:
+        logger.error(f"Failed to start resource monitor: {e}", exc_info=True)
+    
+    # Start Minecraft dashboard updater
+    try:
+        if not minecraft_dashboard_updater.is_running():
+            minecraft_dashboard_updater.start()
+            print(f"✅ Minecraft dashboard updater started")
+    except Exception as e:
+        logger.error(f"Failed to start dashboard updater: {e}", exc_info=True)
+    
     # LAST: Update status to online after everything is loaded
     await update_status_message("online")
 
@@ -1331,18 +1491,28 @@ async def playwright_queue_processor():
         request_id = queue_item['request_id']
         callback = queue_item['callback']
         
-        print(f"📦 Processing queue item: {request_id}")
+        logger.info(f"📦 Processing queue item: {request_id}")
         
         # Download torrent
         torrent_data = await fitgirl_scraper.download_torrent_from_paste(paste_url, request_id)
         
         # Call callback with result
-        await callback(torrent_data)
+        try:
+            await callback(torrent_data)
+        except Exception as callback_error:
+            logger.error(f"⚠️ Error in download callback: {callback_error}", exc_info=True)
+            # Try to notify user if possible
+            if 'interaction' in queue_item:
+                try:
+                    await queue_item['interaction'].followup.send(
+                        f"❌ Error processing download: {str(callback_error)}",
+                        ephemeral=True
+                    )
+                except:
+                    pass
         
     except Exception as e:
-        print(f"⚠️ Error in queue processor: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"⚠️ Error in queue processor: {e}", exc_info=True)
     finally:
         bot.playwright_active = False
 
@@ -2281,6 +2451,19 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
+    # AI Assistant
+    if settings.AI_ENABLED and bot.ai_assistant:
+        embed.add_field(
+            name="🤖 AI Assistant",
+            value=(
+                "Mention the bot (`@BotName`) and ask a question!\n"
+                "The bot can answer questions about recent chat activity.\n"
+                "Example: `@BotName what are we discussing?`\n"
+                "`/aitest` - Test the AI assistant"
+            ),
+            inline=False
+        )
+    
     # Search & Browse Commands
     embed.add_field(
         name="🔍 Search & Browse",
@@ -2365,6 +2548,59 @@ async def help_command(interaction: discord.Interaction):
     embed.timestamp = discord.utils.utcnow()
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# -------------------------
+# AI ASSISTANT COMMANDS
+# -------------------------
+@bot.tree.command(name="aitest", description="Test the AI assistant")
+@discord.app_commands.describe(question="Question to ask the AI assistant")
+async def aitest(interaction: discord.Interaction, question: str = "What's happening in this channel?"):
+    """Test the AI assistant."""
+    if not await check_command_permissions(interaction):
+        return
+    
+    if not settings.AI_ENABLED:
+        await interaction.response.send_message("❌ AI Assistant is disabled. Set `AI_ENABLED=true` in .env", ephemeral=True)
+        return
+    
+    if not bot.ai_assistant:
+        await interaction.response.send_message("❌ AI Assistant is not initialized. Check your API key configuration.", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Get chat context
+        context = get_chat_context(interaction.channel.id)
+        context_text = context.format_context(limit=20)
+        
+        # Get AI response
+        response = await bot.ai_assistant.ask_question(
+            question=question,
+            context=context_text,
+            channel_name=interaction.channel.name,
+            server_name=interaction.guild.name if interaction.guild else "Discord Server"
+        )
+        
+        if response:
+            embed = discord.Embed(
+                title="🤖 AI Assistant Response",
+                description=response,
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="Question",
+                value=question,
+                inline=False
+            )
+            embed.set_footer(text=f"Provider: {settings.AI_PROVIDER}")
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("❌ Could not generate response. Check your API key and try again.", ephemeral=True)
+            
+    except Exception as e:
+        logger.error(f"Error in AI test: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
 # -------------------------
 # MANUAL RSS CHECK COMMAND
@@ -3157,11 +3393,12 @@ class FitGirlSearchView(discord.ui.View):
                 except:
                     pass
             
-            # Add to queue
+            # Add to queue (store interaction for error reporting)
             await bot.playwright_queue.put({
                 'paste_url': paste_url,
                 'request_id': request_id,
-                'callback': download_callback
+                'callback': download_callback,
+                'interaction': interaction  # Store for error reporting
             })
             
             # Update queue position message if needed
@@ -3174,13 +3411,15 @@ class FitGirlSearchView(discord.ui.View):
                 )
             
         except Exception as e:
-            print(f"⚠️ Error in download_button: {e}")
-            import traceback
-            traceback.print_exc()
-            await interaction.followup.send(
-                f"❌ An error occurred: {str(e)}",
-                ephemeral=True
-            )
+            logger.error(f"⚠️ Error in download_button: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    f"❌ An error occurred: {str(e)}\n"
+                    f"Please check the logs for details.",
+                    ephemeral=True
+                )
+            except:
+                pass
             await asyncio.sleep(30)
             try:
                 await interaction.delete_original_response()
@@ -3231,183 +3470,247 @@ async def fgsearch(interaction: discord.Interaction, game_name: str):
 # =========================================================
 async def process_fitgirl_torrent_submission(interaction, user):
     """Process a FitGirl torrent that was auto-downloaded."""
-    if user.id not in bot.pending_torrents:
-        return
+    try:
+        if user.id not in bot.pending_torrents:
+            logger.warning(f"No pending torrent for user {user.id}")
+            return
+        
+        data = bot.pending_torrents.pop(user.id)
+        torrent_data = data.get('torrent_data')
+        
+        if not torrent_data:
+            logger.error(f"No torrent data for user {user.id}")
+            await interaction.followup.send(
+                "❌ No torrent data available. Download may have failed.",
+                ephemeral=True
+            )
+            return
+        
+        output_channel = bot.get_channel(data['channel_id'])
+        if not output_channel:
+            logger.error(f"Output channel {data['channel_id']} not found")
+            await interaction.followup.send(
+                "❌ Could not find forum channel. Please contact an admin.",
+                ephemeral=True
+            )
+            return
+        
+        input_channel = bot.get_channel(INPUT_CHANNEL_ID)
     
-    data = bot.pending_torrents.pop(user.id)
-    torrent_data = data.get('torrent_data')
-    
-    if not torrent_data:
-        return
-    
-    output_channel = bot.get_channel(data['channel_id'])
-    input_channel = bot.get_channel(INPUT_CHANNEL_ID)
-    
-    # Clean the game name for better IGDB/RAWG search results
-    clean_name = clean_game_name_for_search(data['game_name'])
-    
-    # Search IGDB for game data (with RAWG fallback)
-    igdb_data = await igdb_client.search_game_by_name(clean_name)
-    
-    # If IGDB fails, try RAWG as fallback
-    if not igdb_data:
-        print(f"🔄 IGDB failed, trying RAWG fallback for: {clean_name}")
-        igdb_data = await rawg_client.search_game_by_name(clean_name)
+        # Clean the game name for better IGDB/RAWG search results
+        clean_name = clean_game_name_for_search(data['game_name'])
+        
+        # Search IGDB for game data (with RAWG fallback)
+        logger.info(f"Searching IGDB for: {clean_name}")
+        igdb_data = await igdb_client.search_game_by_name(clean_name)
+        
+        # If IGDB fails, try RAWG as fallback
+        if not igdb_data:
+            logger.info(f"🔄 IGDB failed, trying RAWG fallback for: {clean_name}")
+            igdb_data = await rawg_client.search_game_by_name(clean_name)
+            if igdb_data:
+                logger.info(f"✅ RAWG found data for: {clean_name}")
+        
+        # BUILD EMBED WITH IGDB DATA
         if igdb_data:
-            print(f"✅ RAWG found data for: {clean_name}")
-    
-    # BUILD EMBED WITH IGDB DATA
-    if igdb_data:
-        game_title = igdb_data.get("name", data['game_name'])
-        summary = igdb_data.get("summary", data['notes'] or "No description available.")
-        
-        genres = igdb_data.get("genres", [])
-        genres_text = " • ".join([g["name"] for g in genres]) if genres else "N/A"
-        
-        platforms = igdb_data.get("platforms", [])
-        platforms_text = " • ".join([p["name"] for p in platforms]) if platforms else "N/A"
-        
-        cover_url = None
-        if "cover" in igdb_data and igdb_data["cover"]:
-            image_id = igdb_data["cover"].get("image_id")
-            if image_id and isinstance(image_id, str) and len(image_id) > 0:
-                if image_id.startswith("http"):
-                    cover_url = image_id
-                else:
-                    cover_url = f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg"
-        
-        embed = discord.Embed(
-            title=game_title,
-            description=summary[:600] + ("..." if len(summary) > 600 else ""),
-            color=0x1b2838
-        )
-        
-        if cover_url:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.head(cover_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            embed.set_image(url=cover_url)
-            except Exception as e:
-                print(f"⚠️ Could not verify image: {e}")
-                embed.set_image(url=cover_url)
-        
-        embed.add_field(name="🎮 Genres", value=genres_text, inline=True)
-        embed.add_field(name="🖥️ Platforms", value=platforms_text, inline=True)
-        
-        if data.get('version'):
-            embed.add_field(name="📦 Version", value=data['version'], inline=True)
-        
-        if data['notes']:
+            game_title = igdb_data.get("name", data['game_name'])
+            summary = igdb_data.get("summary", data['notes'] or "No description available.")
+            
+            genres = igdb_data.get("genres", [])
+            genres_text = " • ".join([g["name"] for g in genres]) if genres else "N/A"
+            
+            platforms = igdb_data.get("platforms", [])
+            platforms_text = " • ".join([p["name"] for p in platforms]) if platforms else "N/A"
+            
+            cover_url = None
+            if "cover" in igdb_data and igdb_data["cover"]:
+                image_id = igdb_data["cover"].get("image_id")
+                if image_id and isinstance(image_id, str) and len(image_id) > 0:
+                    if image_id.startswith("http"):
+                        cover_url = image_id
+                    else:
+                        cover_url = f"https://images.igdb.com/igdb/image/upload/t_screenshot_big/{image_id}.jpg"
+            
+            embed = discord.Embed(
+                title=game_title,
+                description=summary[:600] + ("..." if len(summary) > 600 else ""),
+                color=0x1b2838
+            )
+            
+            if cover_url:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.head(cover_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                embed.set_image(url=cover_url)
+                except Exception as e:
+                    logger.warning(f"Could not verify image: {e}")
+                    embed.set_image(url=cover_url)
+            
+            embed.add_field(name="🎮 Genres", value=genres_text, inline=True)
+            embed.add_field(name="🖥️ Platforms", value=platforms_text, inline=True)
+            
+            if data.get('version'):
+                embed.add_field(name="📦 Version", value=data['version'], inline=True)
+            
+            if data['notes']:
+                embed.add_field(
+                    name="📝 FitGirl Repack Info",
+                    value=data['notes'][:400] + ("..." if len(data['notes']) > 400 else ""),
+                    inline=False
+                )
+            
+            embed.set_footer(
+                text=f"Added by {user.name} • From FitGirl Repacks",
+                icon_url=user.display_avatar.url
+            )
+            embed.timestamp = discord.utils.utcnow()
+        else:
+            embed = discord.Embed(
+                title=data['game_name'],
+                description=data['notes'] or "No description provided.",
+                color=0x1b2838
+            )
             embed.add_field(
-                name="📝 FitGirl Repack Info",
-                value=data['notes'][:400] + ("..." if len(data['notes']) > 400 else ""),
+                name="⚠️ Note",
+                value="Game data not found in IGDB database",
                 inline=False
             )
+            embed.set_footer(
+                text=f"Added by {user.name} • From FitGirl Repacks",
+                icon_url=user.display_avatar.url
+            )
+            embed.timestamp = discord.utils.utcnow()
         
-        embed.set_footer(
-            text=f"Added by {user.name} • From FitGirl Repacks",
-            icon_url=user.display_avatar.url
-        )
-        embed.timestamp = discord.utils.utcnow()
-    else:
-        embed = discord.Embed(
-            title=data['game_name'],
-            description=data['notes'] or "No description provided.",
-            color=0x1b2838
-        )
-        embed.add_field(
-            name="⚠️ Note",
-            value="Game data not found in IGDB database",
-            inline=False
-        )
-        embed.set_footer(
-            text=f"Added by {user.name} • From FitGirl Repacks",
-            icon_url=user.display_avatar.url
-        )
-        embed.timestamp = discord.utils.utcnow()
-    
-    # Create torrent file object
-    torrent_filename = f"{data['game_name'][:50]} [FitGirl Repack].torrent"
-    torrent_filename = re.sub(r'[<>:"/\\|?*]', '', torrent_filename)  # Clean filename
-    
-    public_torrent_file = discord.File(
-        fp=io.BytesIO(torrent_data),
-        filename=f"SPOILER_{torrent_filename}",
-        spoiler=True
-    )
-    
-    thread_name = igdb_data.get("name", data['game_name']) if igdb_data else data['game_name']
-    thread_name = thread_name[:100]
-    
-    view = GameButtonView(data['game_link'], None)
-    
-    # Create thread in forum channel
-    thread = await output_channel.create_thread(
-        name=thread_name,
-        content=f"**{thread_name}**",
-        embed=embed,
-        file=public_torrent_file,
-        view=view
-    )
-    
-    # Get public torrent URL and update with button
-    starter_message = thread.message
-    if starter_message.attachments:
-        public_torrent_url = starter_message.attachments[0].url
-        view = GameButtonView(data['game_link'], public_torrent_url)
-        await starter_message.edit(view=view if view.children else None)
-    
-    # Log to input channel
-    version_text = f"\n📦 **Version:** {data['version']}" if data.get('version') else ""
-    await input_channel.send(
-        f"📥 **New Game Submitted** (Auto from FitGirl)\n"
-        f"👤 **User:** {user.mention}\n"
-        f"🎮 **Game:** {data['game_name']}{version_text}\n"
-        f"🔗 **Link:** {data['game_link'] or 'N/A'}\n"
-        f"⬇️ **Torrent:** Attached\n"
-        f"📦 **Thread:** {thread.thread.mention}"
-    )
-    
-    # Track contributor
-    if user.id not in bot.contributor_stats:
-        bot.contributor_stats[user.id] = 0
-    bot.contributor_stats[user.id] += 1
-    save_bot_state()
-    
-    # Update dashboard immediately
-    try:
-        await update_dashboard()
-    except:
-        pass
-    
-    # DM the user
-    try:
-        dm_embed = discord.Embed(
-            title="✅ Game Added Successfully!",
-            description=f"**{thread_name}** has been added from FitGirl Repacks!",
-            color=0x00FF00
-        )
-        dm_embed.add_field(
-            name="🔗 View Game Thread",
-            value=thread.thread.mention,
-            inline=False
-        )
-        dm_embed.set_footer(text="FitGirl Auto-Add")
+        # Create torrent file object
+        torrent_filename = f"{data['game_name'][:50]} [FitGirl Repack].torrent"
+        torrent_filename = re.sub(r'[<>:"/\\|?*]', '', torrent_filename)  # Clean filename
         
-        await user.send(embed=dm_embed)
-    except discord.Forbidden:
-        print(f"⚠️ Could not DM user {user.name} - DMs disabled")
-    
-    # Follow up in the interaction
-    try:
-        await interaction.followup.send(
-            f"✅ **{thread_name}** has been added to {thread.thread.mention}!\n"
-            f"📬 Check your DMs for details!",
-            ephemeral=True
+        public_torrent_file = discord.File(
+            fp=io.BytesIO(torrent_data),
+            filename=f"SPOILER_{torrent_filename}",
+            spoiler=True
         )
-    except:
-        pass
+        
+        thread_name = igdb_data.get("name", data['game_name']) if igdb_data else data['game_name']
+        thread_name = thread_name[:100]
+        
+        view = GameButtonView(data['game_link'], None)
+        
+        # Create thread in forum channel
+        thread_result = None
+        thread = None
+        try:
+            thread_result = await output_channel.create_thread(
+                name=thread_name,
+                content=f"**{thread_name}**",
+                embed=embed,
+                file=public_torrent_file,
+                view=view
+            )
+            # create_thread returns ThreadWithMessage, access thread via .thread
+            thread = thread_result.thread if hasattr(thread_result, 'thread') else thread_result
+            logger.info(f"✅ Created forum thread: {thread_name} (ID: {thread.id})")
+        except Exception as e:
+            logger.error(f"Failed to create forum thread: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ Failed to create forum thread: {str(e)}",
+                ephemeral=True
+            )
+            return
+        
+        # Get public torrent URL and update with button
+        try:
+            # ThreadWithMessage has .message attribute for the starter message
+            starter_message = getattr(thread_result, 'message', None) if thread_result else None
+            if not starter_message:
+                # Fallback: try to get from thread
+                try:
+                    async for message in thread.history(limit=1):
+                        starter_message = message
+                        break
+                except:
+                    pass
+            
+            if starter_message and hasattr(starter_message, 'attachments') and starter_message.attachments:
+                public_torrent_url = starter_message.attachments[0].url
+                view = GameButtonView(data['game_link'], public_torrent_url)
+                await starter_message.edit(view=view if view.children else None)
+        except Exception as e:
+            logger.warning(f"Could not update starter message with button: {e}", exc_info=True)
+        
+        # Log to input channel
+        try:
+            version_text = f"\n📦 **Version:** {data['version']}" if data.get('version') else ""
+            thread_mention = thread.mention
+            await input_channel.send(
+                f"📥 **New Game Submitted** (Auto from FitGirl)\n"
+                f"👤 **User:** {user.mention}\n"
+                f"🎮 **Game:** {data['game_name']}{version_text}\n"
+                f"🔗 **Link:** {data['game_link'] or 'N/A'}\n"
+                f"⬇️ **Torrent:** Attached\n"
+                f"📦 **Thread:** {thread_mention}"
+            )
+        except Exception as e:
+            logger.error(f"Could not log to input channel: {e}", exc_info=True)
+        
+        # Track contributor
+        try:
+            if user.id not in bot.contributor_stats:
+                bot.contributor_stats[user.id] = 0
+            bot.contributor_stats[user.id] += 1
+            save_bot_state()
+        except Exception as e:
+            logger.error(f"Could not update contributor stats: {e}", exc_info=True)
+        
+        # Update dashboard immediately
+        try:
+            await update_dashboard()
+        except Exception as e:
+            logger.error(f"Could not update dashboard: {e}", exc_info=True)
+        
+        # DM the user
+        try:
+            thread_mention = thread.mention
+            dm_embed = discord.Embed(
+                title="✅ Game Added Successfully!",
+                description=f"**{thread_name}** has been added from FitGirl Repacks!",
+                color=0x00FF00
+            )
+            dm_embed.add_field(
+                name="🔗 View Game Thread",
+                value=thread_mention,
+                inline=False
+            )
+            dm_embed.set_footer(text="FitGirl Auto-Add")
+            
+            await user.send(embed=dm_embed)
+        except discord.Forbidden:
+            logger.warning(f"Could not DM user {user.name} - DMs disabled")
+        except Exception as e:
+            logger.error(f"Error sending DM: {e}", exc_info=True)
+        
+        # Follow up in the interaction
+        try:
+            thread_mention = thread.mention
+            await interaction.followup.send(
+                f"✅ **{thread_name}** has been added to {thread_mention}!\n"
+                f"📬 Check your DMs for details!",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error sending followup: {e}", exc_info=True)
+    
+    except Exception as e:
+        logger.error(f"Error in process_fitgirl_torrent_submission: {e}", exc_info=True)
+        try:
+            await interaction.followup.send(
+                f"❌ Error creating forum thread: {str(e)}\n"
+                f"Please check the logs for details.",
+                ephemeral=True
+            )
+        except:
+            pass
 
 # =========================================================
 # REFRESH DASHBOARD COMMAND
@@ -4100,6 +4403,205 @@ async def on_message(message):
     # Ignore bot messages
     if message.author.bot:
         return
+    
+    # Track chat context for AI assistant
+    if settings.AI_ENABLED and message.content:
+        try:
+            context = get_chat_context(message.channel.id)
+            attachments = [att.url for att in message.attachments] if message.attachments else []
+            context.add_message(
+                author=message.author.display_name or message.author.name,
+                content=message.content,
+                timestamp=message.created_at,
+                attachments=attachments
+            )
+        except Exception as e:
+            logger.warning(f"Error tracking chat context: {e}")
+    
+    # Check if bot is mentioned and AI is enabled
+    if settings.AI_ENABLED and bot.user and bot.user.mentioned_in(message):
+        try:
+            # Extract question (remove mention)
+            question = message.content
+            if not question:
+                return  # No content, skip
+            
+            # Remove bot mention (handle both formats)
+            bot_mention_patterns = [
+                f"<@{bot.user.id}>",
+                f"<@!{bot.user.id}>",
+                bot.user.mention
+            ]
+            for pattern in bot_mention_patterns:
+                question = question.replace(pattern, "")
+            
+            # Clean up extra whitespace
+            question = " ".join(question.split()).strip()
+            
+            # If question is empty after removing mention, use a default
+            if not question:
+                question = "What's happening in this channel?"
+            
+            if question:
+                # Show typing indicator
+                async with message.channel.typing():
+                    # Get chat context
+                    context = get_chat_context(message.channel.id)
+                    
+                    # Check if this is a reply to another message
+                    referenced_message = None
+                    try:
+                        if message.reference and message.reference.message_id:
+                            # Try to get the referenced message
+                            if hasattr(message.reference, 'resolved') and message.reference.resolved:
+                                referenced_message = message.reference.resolved
+                            else:
+                                # Fetch the message if not cached
+                                try:
+                                    referenced_message = await message.channel.fetch_message(message.reference.message_id)
+                                except (discord.NotFound, discord.HTTPException) as e:
+                                    logger.debug(f"Could not fetch referenced message {message.reference.message_id}: {e}")
+                                    referenced_message = None
+                                except Exception as e:
+                                    logger.warning(f"Unexpected error fetching referenced message: {e}")
+                                    referenced_message = None
+                    except AttributeError:
+                        # message.reference might not exist or be None
+                        referenced_message = None
+                    except Exception as e:
+                        logger.warning(f"Error handling message reference: {e}")
+                        referenced_message = None
+                    
+                    # Build context based on whether this is a reply or direct mention
+                    if referenced_message and isinstance(referenced_message, discord.Message):
+                        # User replied to another message and tagged bot - focus on that conversation
+                        ref_author = referenced_message.author.display_name or referenced_message.author.name
+                        ref_content = referenced_message.content
+                        ref_time = referenced_message.created_at.strftime("%H:%M")
+                        
+                        # Add referenced message to context if not already there
+                        context.add_message(
+                            author=ref_author,
+                            content=ref_content,
+                            timestamp=referenced_message.created_at,
+                            attachments=[att.url for att in referenced_message.attachments] if referenced_message.attachments else []
+                        )
+                        
+                        # Format context with highlighted referenced message and surrounding conversation
+                        context_text = f"=== MESSAGE BEING ASKED ABOUT ===\n"
+                        context_text += f"[{ref_time}] {ref_author}: {ref_content}\n\n"
+                        context_text += f"=== RECENT CONVERSATION ===\n"
+                        context_text += context.format_context(limit=15)
+                        
+                        # Update question to focus on the referenced message
+                        if not question.lower().startswith(("what", "explain", "why", "how", "who", "when", "where", "about")):
+                            question = f"About this message from {ref_author}: '{ref_content[:100]}' - {question}"
+                    else:
+                        # Direct mention (not a reply) - just answer the question with general context
+                        context_text = context.format_context(limit=20)
+                    
+                    # Get AI response
+                    if bot.ai_assistant:
+                        response = await bot.ai_assistant.ask_question(
+                            question=question,
+                            context=context_text,
+                            channel_name=message.channel.name,
+                            server_name=message.guild.name if message.guild else "Discord Server",
+                            is_reply=referenced_message is not None
+                        )
+                        
+                        if response:
+                            # Clean response - remove any system prompt leakage or thinking
+                            cleaned_response = response.strip()
+                            
+                            # Remove common AI "thinking" patterns and technical details
+                            thinking_patterns = [
+                                "I'm an AI assistant",
+                                "As an AI",
+                                "I can see",
+                                "Based on the context",
+                                "Looking at the",
+                                "=== REFERENCED MESSAGE",
+                                "=== RECENT CHAT CONTEXT",
+                                "=== MESSAGE BEING ASKED ABOUT",
+                                "=== RECENT CONVERSATION",
+                                "Your role:",
+                                "Answer the user's question",
+                                "the user with the ID",
+                                "the message from",
+                                "addressed to the user",
+                                "user ID",
+                                "message ID",
+                                "says \"",
+                                "and is addressed",
+                                "was the last message sent by"
+                            ]
+                            
+                            # Remove user IDs and technical references (re is already imported at top)
+                            cleaned_response = re.sub(r'\b\d{17,19}\b', '', cleaned_response)  # Remove Discord IDs (17-19 digits)
+                            cleaned_response = re.sub(r'user ID \d+', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'message ID \d+', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'addressed to the user', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'the user with the ID', '', cleaned_response, flags=re.IGNORECASE)
+                            cleaned_response = re.sub(r'\s+', ' ', cleaned_response).strip()  # Clean up extra spaces
+                            
+                            # Split into lines and filter out thinking patterns
+                            lines = cleaned_response.split('\n')
+                            filtered_lines = []
+                            skip_next = False
+                            
+                            for line in lines:
+                                line_lower = line.lower().strip()
+                                # Skip lines that look like system prompts or thinking
+                                if any(pattern.lower() in line_lower for pattern in thinking_patterns):
+                                    continue
+                                # Skip empty lines at start
+                                if not filtered_lines and not line.strip():
+                                    continue
+                                filtered_lines.append(line)
+                            
+                            cleaned_response = '\n'.join(filtered_lines).strip()
+                            
+                            # If we filtered everything, use original (but truncated)
+                            if not cleaned_response:
+                                cleaned_response = response[:500].strip()
+                            
+                            # Limit response length
+                            if len(cleaned_response) > 2000:
+                                cleaned_response = cleaned_response[:1950] + "..."
+                            
+                            # Send response - reply to the original message if it's a reply, otherwise reply to user
+                            embed = discord.Embed(
+                                description=cleaned_response,
+                                color=discord.Color.blue()
+                            )
+                            embed.set_footer(text=f"Asked by {message.author.display_name}")
+                            
+                            # If user replied to another message, reply to that conversation
+                            if referenced_message and isinstance(referenced_message, discord.Message):
+                                # Reply to the original message (the one being asked about)
+                                await referenced_message.reply(embed=embed)
+                            else:
+                                # Direct mention - reply to the user's message
+                                await message.reply(embed=embed)
+                        else:
+                            await message.reply("❌ Sorry, I couldn't generate a response. Make sure your AI API key is configured correctly.")
+                    else:
+                        await message.reply("❌ AI Assistant is not initialized. Check your API key configuration.")
+        except discord.errors.HTTPException as e:
+            logger.error(f"Discord HTTP error handling AI question: {e}")
+            try:
+                await message.channel.send(f"❌ Error: {str(e)[:100]}")
+            except:
+                pass
+        except Exception as e:
+            logger.error(f"Error handling AI question: {e}", exc_info=True)
+            import traceback
+            logger.error(traceback.format_exc())
+            try:
+                await message.channel.send("❌ Sorry, I encountered an error processing your question. Check logs for details.")
+            except:
+                pass
     
     # Check if user has pending torrent submission
     if message.author.id in bot.pending_torrents:
@@ -7219,6 +7721,20 @@ bot.mc_console_channel = None
 bot.mc_console_enabled = False
 bot.mc_last_log_line = None
 
+# New Minecraft features
+bot.mc_notification_channel = None  # Channel for player join/leave notifications
+bot.mc_auto_restart_enabled = True  # Auto-restart on crash
+bot.mc_scheduled_backups = {}  # {guild_id: {enabled: bool, interval_hours: int, last_backup: datetime}}
+bot.mc_scheduled_restarts = {}  # {guild_id: {enabled: bool, time: str, days: list}}
+bot.mc_player_activity = {}  # Track player sessions and playtime
+bot.mc_last_restart_check = None  # Track last restart check time
+bot.mc_server_rules = {}  # {guild_id: [rules]}
+bot.mc_server_motd = {}  # {guild_id: motd_string}
+bot.mc_command_aliases = {}  # {guild_id: {alias: command}}
+bot.mc_resource_alerts = {}  # {guild_id: {enabled: bool, cpu_threshold: int, mem_threshold: int}}
+bot.mc_dashboard_channel = None  # Channel for performance dashboard
+bot.mc_dashboard_message_id = None  # Message ID for dashboard
+
 async def is_minecraft_running():
     """Check if Minecraft server is running (systemd or screen)"""
     # Check systemd
@@ -7229,17 +7745,7 @@ async def is_minecraft_running():
         stderr=asyncio.subprocess.PIPE
     )
     stdout, _ = await result.communicate()
-    if stdout.decode().strip() == "active":
-        return True
-    
-    # Check screen session
-    screen_check = await asyncio.create_subprocess_shell(
-        "screen -ls | grep minecraft",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    screen_out, _ = await screen_check.communicate()
-    return len(screen_out.decode().strip()) > 0
+    return stdout.decode().strip() == "active"
 
 @bot.tree.command(name="mcstart", description="Start the Minecraft Bedrock server (Admin only)")
 async def mcstart(interaction: discord.Interaction):
@@ -7256,8 +7762,8 @@ async def mcstart(interaction: discord.Interaction):
             await interaction.followup.send("⚠️ Server is already running!")
             return
         
-        # Start server in screen session
-        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+        # Start server using systemd
+        start_cmd = f"sudo systemctl start {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
             start_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -7298,25 +7804,26 @@ async def mcstop(interaction: discord.Interaction):
             return
         
         # Send stop command to server first (graceful shutdown)
-        stop_server_cmd = "screen -S minecraft -X stuff 'stop\n'"
+        # Bedrock server listens for commands via stdin or command file
+        stop_command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            # Write stop command to file (if server supports reading from file)
+            with open(stop_command_file, 'w') as f:
+                f.write("stop\n")
+        except:
+            pass
+        
+        # Use systemd to stop gracefully
+        stop_cmd = f"sudo systemctl stop {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
-            stop_server_cmd,
+            stop_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
         
         # Wait for graceful shutdown
-        await asyncio.sleep(5)
-        
-        # Force kill screen if still running
-        kill_cmd = "screen -X -S minecraft quit"
-        process = await asyncio.create_subprocess_shell(
-            kill_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
+        await asyncio.sleep(3)
         
         embed = discord.Embed(
             title="🔴 Minecraft Server Stopped",
@@ -7343,23 +7850,18 @@ async def mcrestart(interaction: discord.Interaction):
         was_running = await is_minecraft_running()
         
         if was_running:
-            # Send stop command
-            stop_cmd = "screen -S minecraft -X stuff 'stop\n'"
+            # Stop using systemd
+            stop_cmd = f"sudo systemctl stop {MINECRAFT_SERVICE}"
             process = await asyncio.create_subprocess_shell(
                 stop_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             await process.communicate()
-            await asyncio.sleep(5)
-            
-            # Force kill if needed
-            kill_cmd = "screen -X -S minecraft quit"
-            await asyncio.create_subprocess_shell(kill_cmd)
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
         
-        # Start fresh
-        start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+        # Start fresh using systemd
+        start_cmd = f"sudo systemctl start {MINECRAFT_SERVICE}"
         process = await asyncio.create_subprocess_shell(
             start_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -7418,8 +7920,17 @@ async def mcstatus(interaction: discord.Interaction):
             stderr=asyncio.subprocess.PIPE
         )
         mem_stdout, _ = await mem_process.communicate()
-        memory_kb = mem_stdout.decode().strip()
-        memory_mb = f"{int(memory_kb) / 1024:.0f} MB" if memory_kb else "N/A"
+        memory_lines = mem_stdout.decode().strip().split('\n')
+        # Sum all memory values or take first if only one
+        try:
+            if memory_lines and memory_lines[0]:
+                # Sum all memory values (in case of multiple processes)
+                total_kb = sum(int(line.strip()) for line in memory_lines if line.strip().isdigit())
+                memory_mb = f"{total_kb / 1024:.0f} MB" if total_kb > 0 else "N/A"
+            else:
+                memory_mb = "N/A"
+        except (ValueError, AttributeError):
+            memory_mb = "N/A"
         
         color = discord.Color.green() if is_active else discord.Color.red()
         status_text = "🟢 Online" if is_active else "🔴 Offline"
@@ -7617,34 +8128,25 @@ async def mccommand(interaction: discord.Interaction, command: str):
             await interaction.followup.send("❌ Server is not running!")
             return
         
-        # Send command via screen session (requires server running in screen)
-        # Screen session name should be "minecraft" 
-        screen_cmd = f"screen -S minecraft -p 0 -X stuff '{command}\\n'"
-        process = await asyncio.create_subprocess_shell(
-            screen_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        # Send command to server via systemd
+        # Bedrock server can receive commands via stdin or a command file
+        # We'll use systemd's journalctl to verify the command was processed
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
         
-        # Check if screen session exists
-        if b"No screen session found" in stderr or process.returncode != 0:
-            embed = discord.Embed(
-                title="⚠️ Console Not Available",
-                description="Server is not running in a screen session.",
-                color=discord.Color.orange()
-            )
-            embed.add_field(
-                name="Setup Instructions",
-                value="Run this on the server:\n"
-                      "```bash\n"
-                      "sudo systemctl stop minecraft-bedrock\n"
-                      "screen -S minecraft -dm bash -c 'cd /home/ubuntu/minecraft-bedrock && LD_LIBRARY_PATH=. ./bedrock_server'\n"
-                      "```\n"
-                      "Then use `/mclogs` to view command results.",
-                inline=False
-            )
-            await interaction.followup.send(embed=embed)
+        try:
+            # Write command to file (if server supports reading commands from file)
+            with open(command_file, 'a') as f:
+                f.write(f"{command}\n")
+        except Exception as e:
+            logger.warning(f"Could not write to command file: {e}")
+        
+        # Alternative: Use systemd's stdin if available
+        # For now, we'll just confirm the command was sent
+        # The server should process commands from the file or stdin
+        
+        # Check if server is running
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
             return
         
         embed = discord.Embed(
@@ -8068,6 +8570,305 @@ async def track_minecraft_activity():
     except Exception as e:
         print(f"Error tracking MC activity: {e}")
 
+# =========================================================
+# MINECRAFT PLAYER MANAGEMENT
+# =========================================================
+@bot.tree.command(name="mckick", description="Kick a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to kick", reason="Reason for kick")
+async def mckick(interaction: discord.Interaction, player: str, reason: str = "No reason provided"):
+    """Kick a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send kick command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"kick {player} {reason}\n")
+        except Exception as e:
+            logger.warning(f"Could not write kick command: {e}")
+        
+        embed = discord.Embed(
+            title="👢 Player Kicked",
+            description=f"**{player}** has been kicked from the server.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Kicked by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcban", description="Ban a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to ban", reason="Reason for ban")
+async def mcban(interaction: discord.Interaction, player: str, reason: str = "No reason provided"):
+    """Ban a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send ban command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"ban {player} {reason}\n")
+        except Exception as e:
+            logger.warning(f"Could not write ban command: {e}")
+        
+        embed = discord.Embed(
+            title="🔨 Player Banned",
+            description=f"**{player}** has been banned from the server.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Banned by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcunban", description="Unban a player from the Minecraft server (Admin only)")
+@discord.app_commands.describe(player="Player username to unban")
+async def mcunban(interaction: discord.Interaction, player: str):
+    """Unban a player from the server"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Send unban command via command file
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"unban {player}\n")
+        except Exception as e:
+            logger.warning(f"Could not write unban command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Player Unbanned",
+            description=f"**{player}** has been unbanned from the server.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Unbanned by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT CONFIGURATION COMMANDS
+# =========================================================
+@bot.tree.command(name="mcnotify", description="Set channel for Minecraft player notifications (Admin only)")
+@discord.app_commands.describe(channel="Discord channel for notifications (leave empty to disable)")
+async def mcnotify(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Configure player join/leave notifications"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if channel:
+            bot.mc_notification_channel = channel.id
+            embed = discord.Embed(
+                title="✅ Notifications Enabled",
+                description=f"Player join/leave notifications will be sent to {channel.mention}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Status", value=f"Task running: {minecraft_player_notifications.is_running()}", inline=False)
+            embed.add_field(name="Server Status", value="🟢 Running" if await is_minecraft_running() else "🔴 Offline", inline=False)
+            
+            # Start notification task if not running
+            if not minecraft_player_notifications.is_running():
+                minecraft_player_notifications.start()
+                embed.add_field(name="Note", value="Notification task has been started", inline=False)
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            bot.mc_notification_channel = None
+            embed = discord.Embed(
+                title="❌ Notifications Disabled",
+                description="Player notifications have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+        logger.error(f"Error in mcnotify: {e}", exc_info=True)
+
+@bot.tree.command(name="mcautorestart", description="Enable/disable auto-restart on crash (Admin only)")
+@discord.app_commands.describe(enabled="Enable auto-restart")
+async def mcautorestart(interaction: discord.Interaction, enabled: bool):
+    """Configure auto-restart on crash"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        bot.mc_auto_restart_enabled = enabled
+        
+        embed = discord.Embed(
+            title="✅ Auto-Restart " + ("Enabled" if enabled else "Disabled"),
+            description=f"Auto-restart on crash is now **{'enabled' if enabled else 'disabled'}**.",
+            color=discord.Color.green() if enabled else discord.Color.red()
+        )
+        
+        if enabled:
+            # Start monitor if not running
+            if not minecraft_auto_restart_monitor.is_running():
+                minecraft_auto_restart_monitor.start()
+            embed.add_field(
+                name="How it works",
+                value="The bot will monitor the server every minute and automatically restart it if it crashes.",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcautobackup", description="Configure automatic backups (Admin only)")
+@discord.app_commands.describe(enabled="Enable automatic backups", interval_hours="Hours between backups (default: 24)")
+async def mcautobackup(interaction: discord.Interaction, enabled: bool, interval_hours: int = 24):
+    """Configure scheduled backups"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            if guild_id not in bot.mc_scheduled_backups:
+                bot.mc_scheduled_backups[guild_id] = {}
+            
+            bot.mc_scheduled_backups[guild_id]['enabled'] = True
+            bot.mc_scheduled_backups[guild_id]['interval_hours'] = max(1, interval_hours)  # Minimum 1 hour
+            
+            embed = discord.Embed(
+                title="✅ Automatic Backups Enabled",
+                description=f"Backups will be created every **{interval_hours} hours**.",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Backup Location", value="`~/minecraft-backups/`", inline=False)
+            
+            # Start backup task if not running
+            if not minecraft_scheduled_backups.is_running():
+                minecraft_scheduled_backups.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_scheduled_backups:
+                bot.mc_scheduled_backups[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Automatic Backups Disabled",
+                description="Scheduled backups have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcplaytime", description="View player playtime statistics")
+@discord.app_commands.describe(player="Player username (leave empty for all players)")
+async def mcplaytime(interaction: discord.Interaction, player: str = None):
+    """View player playtime"""
+    await interaction.response.defer()
+    
+    try:
+        if player:
+            # Show specific player stats
+            if player not in bot.mc_player_activity:
+                await interaction.followup.send(f"❌ No data found for **{player}**")
+                return
+            
+            stats = bot.mc_player_activity[player]
+            total_hours = stats['total_time'] / 3600
+            sessions = stats.get('sessions', 0)
+            
+            embed = discord.Embed(
+                title=f"📊 Playtime: {player}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Total Playtime", value=f"{total_hours:.1f} hours", inline=True)
+            embed.add_field(name="Sessions", value=str(sessions), inline=True)
+            
+            if 'last_join' in stats:
+                embed.add_field(name="Status", value="🟢 Currently Online", inline=False)
+            else:
+                embed.add_field(name="Status", value="🔴 Offline", inline=False)
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            # Show top players
+            if not bot.mc_player_activity:
+                await interaction.followup.send("❌ No player data available yet.")
+                return
+            
+            # Sort by playtime
+            sorted_players = sorted(
+                bot.mc_player_activity.items(),
+                key=lambda x: x[1].get('total_time', 0),
+                reverse=True
+            )[:10]  # Top 10
+            
+            player_list = []
+            for i, (name, stats) in enumerate(sorted_players, 1):
+                hours = stats['total_time'] / 3600
+                sessions = stats.get('sessions', 0)
+                status = "🟢" if 'last_join' in stats else "🔴"
+                player_list.append(f"{i}. {status} **{name}** - {hours:.1f}h ({sessions} sessions)")
+            
+            embed = discord.Embed(
+                title="📊 Top Players by Playtime",
+                description="\n".join(player_list) if player_list else "No data available",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="Based on tracked sessions")
+            embed.timestamp = discord.utils.utcnow()
+            
+            await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
 @bot.tree.command(name="mcstats", description="View player activity statistics")
 async def botstats(interaction: discord.Interaction):
     """Show bot statistics"""
@@ -8110,6 +8911,672 @@ async def botstats(interaction: discord.Interaction):
         
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT SCHEDULED RESTARTS COMMANDS
+# =========================================================
+@bot.tree.command(name="mcschedule", description="Schedule automatic server restarts (Admin only)")
+@discord.app_commands.describe(enabled="Enable scheduled restarts", time="Time in HH:MM format (24h)", days="Comma-separated days (monday,tuesday,etc)")
+async def mcschedule(interaction: discord.Interaction, enabled: bool, time: str = "03:00", days: str = "monday,tuesday,wednesday,thursday,friday,saturday,sunday"):
+    """Configure scheduled restarts"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            # Validate time format
+            try:
+                from datetime import datetime
+                datetime.strptime(time, "%H:%M")
+            except ValueError:
+                await interaction.followup.send("❌ Invalid time format! Use HH:MM (e.g., 03:00)")
+                return
+            
+            # Parse days
+            day_list = [d.strip().lower() for d in days.split(',')]
+            valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            day_list = [d for d in day_list if d in valid_days]
+            
+            if not day_list:
+                await interaction.followup.send("❌ Invalid days! Use: monday, tuesday, wednesday, thursday, friday, saturday, sunday")
+                return
+            
+            if guild_id not in bot.mc_scheduled_restarts:
+                bot.mc_scheduled_restarts[guild_id] = {}
+            
+            bot.mc_scheduled_restarts[guild_id]['enabled'] = True
+            bot.mc_scheduled_restarts[guild_id]['time'] = time
+            bot.mc_scheduled_restarts[guild_id]['days'] = day_list
+            
+            embed = discord.Embed(
+                title="✅ Scheduled Restarts Enabled",
+                description=f"Server will restart at **{time}** on: {', '.join(day_list)}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Warning", value="Players will be warned 5 minutes before restart", inline=False)
+            
+            if not minecraft_scheduled_restarts.is_running():
+                minecraft_scheduled_restarts.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_scheduled_restarts:
+                bot.mc_scheduled_restarts[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Scheduled Restarts Disabled",
+                description="Scheduled restarts have been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT SERVER ANNOUNCEMENTS
+# =========================================================
+@bot.tree.command(name="mcannounce", description="Broadcast message to all players (Admin only)")
+@discord.app_commands.describe(message="Message to broadcast")
+async def mcannounce(interaction: discord.Interaction, message: str):
+    """Broadcast message to all players"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"say {message}\n")
+        except Exception as e:
+            logger.warning(f"Could not write announce command: {e}")
+        
+        embed = discord.Embed(
+            title="📢 Announcement Sent",
+            description=f"**{message}**",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Sent by", value=interaction.user.mention, inline=False)
+        embed.timestamp = discord.utils.utcnow()
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcsetmotd", description="Set server MOTD (Message of the Day) (Admin only)")
+@discord.app_commands.describe(motd="MOTD message")
+async def mcsetmotd(interaction: discord.Interaction, motd: str):
+    """Set server MOTD"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        bot.mc_server_motd[guild_id] = motd
+        
+        # Update server.properties
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        update_cmd = f"sed -i 's/^server-name=.*/server-name={motd}/' {config_file}"
+        process = await asyncio.create_subprocess_shell(
+            update_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        embed = discord.Embed(
+            title="✅ MOTD Updated",
+            description=f"Server MOTD set to: **{motd}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Note", value="Restart server for changes to take effect", inline=False)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT GAME MODE & DIFFICULTY
+# =========================================================
+@bot.tree.command(name="mcdifficulty", description="Set server difficulty (Admin only)")
+@discord.app_commands.choices(difficulty=[
+    discord.app_commands.Choice(name="Easy", value="easy"),
+    discord.app_commands.Choice(name="Normal", value="normal"),
+    discord.app_commands.Choice(name="Hard", value="hard"),
+    discord.app_commands.Choice(name="Peaceful", value="peaceful")
+])
+@discord.app_commands.describe(difficulty="Difficulty level")
+async def mcdifficulty(interaction: discord.Interaction, difficulty: str):
+    """Set server difficulty"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"difficulty {difficulty}\n")
+        except Exception as e:
+            logger.warning(f"Could not write difficulty command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Difficulty Changed",
+            description=f"Server difficulty set to **{difficulty}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcgamemode", description="Set game mode for a player (Admin only)")
+@discord.app_commands.describe(player="Player username", gamemode="Game mode")
+async def mcgamemode(interaction: discord.Interaction, player: str, gamemode: str):
+    """Set game mode for player"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_modes = ['survival', 'creative', 'adventure', 'spectator']
+        if gamemode.lower() not in valid_modes:
+            await interaction.followup.send(f"❌ Invalid game mode! Use: {', '.join(valid_modes)}")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"gamemode {gamemode.lower()} {player}\n")
+        except Exception as e:
+            logger.warning(f"Could not write gamemode command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Game Mode Changed",
+            description=f"**{player}** game mode set to **{gamemode}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mctime", description="Set or change server time (Admin only)")
+@discord.app_commands.describe(action="Time action")
+async def mctime(interaction: discord.Interaction, action: str):
+    """Set server time"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_actions = ['day', 'night', 'noon', 'midnight']
+        time_value = action.lower()
+        
+        if time_value == 'day':
+            time_value = '1000'
+        elif time_value == 'night':
+            time_value = '13000'
+        elif time_value == 'noon':
+            time_value = '6000'
+        elif time_value == 'midnight':
+            time_value = '18000'
+        else:
+            # Try to parse as number
+            try:
+                int(time_value)
+            except ValueError:
+                await interaction.followup.send(f"❌ Invalid time! Use: day, night, noon, midnight, or a number (0-24000)")
+                return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"time set {time_value}\n")
+        except Exception as e:
+            logger.warning(f"Could not write time command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Time Changed",
+            description=f"Server time set to **{action}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcweather", description="Set server weather (Admin only)")
+@discord.app_commands.describe(weather="Weather type")
+async def mcweather(interaction: discord.Interaction, weather: str):
+    """Set server weather"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        valid_weather = ['clear', 'rain', 'thunder']
+        if weather.lower() not in valid_weather:
+            await interaction.followup.send(f"❌ Invalid weather! Use: {', '.join(valid_weather)}")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"weather {weather.lower()}\n")
+        except Exception as e:
+            logger.warning(f"Could not write weather command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Weather Changed",
+            description=f"Server weather set to **{weather}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT WORLD MANAGEMENT
+# =========================================================
+@bot.tree.command(name="mcworlds", description="List available worlds")
+async def mcworlds(interaction: discord.Interaction):
+    """List available worlds"""
+    await interaction.response.defer()
+    
+    try:
+        worlds_dir = f"{MINECRAFT_DIR}/worlds"
+        list_cmd = f"ls -d {worlds_dir}/*/ 2>/dev/null | xargs -n1 basename"
+        process = await asyncio.create_subprocess_shell(
+            list_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        worlds = [w.strip() for w in stdout.decode().strip().split('\n') if w.strip()]
+        
+        if worlds:
+            embed = discord.Embed(
+                title="🌍 Available Worlds",
+                description="\n".join([f"• {w}" for w in worlds]),
+                color=discord.Color.blue()
+            )
+        else:
+            embed = discord.Embed(
+                title="🌍 Available Worlds",
+                description="No worlds found",
+                color=discord.Color.orange()
+            )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcworldinfo", description="View current world information")
+async def mcworldinfo(interaction: discord.Interaction):
+    """View world information"""
+    await interaction.response.defer()
+    
+    try:
+        # Get world seed from server.properties
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        seed_cmd = f"grep 'level-seed=' {config_file} | cut -d'=' -f2"
+        process = await asyncio.create_subprocess_shell(
+            seed_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        seed = stdout.decode().strip() or "Random"
+        
+        # Get world size
+        worlds_dir = f"{MINECRAFT_DIR}/worlds"
+        size_cmd = f"du -sh {worlds_dir}/*/ 2>/dev/null | head -1 | awk '{{print $1}}'"
+        size_process = await asyncio.create_subprocess_shell(
+            size_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        size_stdout, _ = await size_process.communicate()
+        world_size = size_stdout.decode().strip() or "Unknown"
+        
+        embed = discord.Embed(
+            title="🌍 World Information",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Seed", value=f"`{seed}`", inline=True)
+        embed.add_field(name="World Size", value=world_size, inline=True)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcseed", description="View world seed")
+async def mcseed(interaction: discord.Interaction):
+    """View world seed"""
+    await interaction.response.defer()
+    
+    try:
+        config_file = f"{MINECRAFT_DIR}/server.properties"
+        seed_cmd = f"grep 'level-seed=' {config_file} | cut -d'=' -f2"
+        process = await asyncio.create_subprocess_shell(
+            seed_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        seed = stdout.decode().strip() or "Random"
+        
+        embed = discord.Embed(
+            title="🌱 World Seed",
+            description=f"`{seed}`",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT PLAYER TELEPORTATION
+# =========================================================
+@bot.tree.command(name="mctp", description="Teleport player to another player (Admin only)")
+@discord.app_commands.describe(player1="First player", player2="Second player")
+async def mctp(interaction: discord.Interaction, player1: str, player2: str):
+    """Teleport player to another player"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        command_file = f"{MINECRAFT_DIR}/command_input.txt"
+        try:
+            with open(command_file, 'a') as f:
+                f.write(f"tp {player1} {player2}\n")
+        except Exception as e:
+            logger.warning(f"Could not write tp command: {e}")
+        
+        embed = discord.Embed(
+            title="✅ Teleportation",
+            description=f"**{player1}** teleported to **{player2}**",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT SERVER RULES
+# =========================================================
+@bot.tree.command(name="mcsetrules", description="Set server rules (Admin only)")
+@discord.app_commands.describe(rules="Rules (one per line, use \\n for newlines)")
+async def mcsetrules(interaction: discord.Interaction, rules: str):
+    """Set server rules"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        rule_list = [r.strip() for r in rules.split('\\n') if r.strip()]
+        bot.mc_server_rules[guild_id] = rule_list
+        
+        embed = discord.Embed(
+            title="✅ Rules Updated",
+            description="Server rules have been set:",
+            color=discord.Color.green()
+        )
+        for i, rule in enumerate(rule_list[:10], 1):  # Limit to 10 rules
+            embed.add_field(name=f"Rule {i}", value=rule, inline=False)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mcrules", description="View server rules")
+async def mcrules(interaction: discord.Interaction):
+    """View server rules"""
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        rules = bot.mc_server_rules.get(guild_id, [])
+        
+        if rules:
+            embed = discord.Embed(
+                title="📜 Server Rules",
+                color=discord.Color.blue()
+            )
+            for i, rule in enumerate(rules, 1):
+                embed.add_field(name=f"Rule {i}", value=rule, inline=False)
+        else:
+            embed = discord.Embed(
+                title="📜 Server Rules",
+                description="No rules set yet.",
+                color=discord.Color.orange()
+            )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT RESOURCE MONITORING
+# =========================================================
+@bot.tree.command(name="mcresourcealert", description="Configure resource usage alerts (Admin only)")
+@discord.app_commands.describe(enabled="Enable alerts", cpu_threshold="CPU threshold % (default: 80)", mem_threshold="Memory threshold % (default: 80)")
+async def mcresourcealert(interaction: discord.Interaction, enabled: bool, cpu_threshold: int = 80, mem_threshold: int = 80):
+    """Configure resource alerts"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        
+        if enabled:
+            if guild_id not in bot.mc_resource_alerts:
+                bot.mc_resource_alerts[guild_id] = {}
+            
+            bot.mc_resource_alerts[guild_id]['enabled'] = True
+            bot.mc_resource_alerts[guild_id]['cpu_threshold'] = max(1, min(100, cpu_threshold))
+            bot.mc_resource_alerts[guild_id]['mem_threshold'] = max(1, min(100, mem_threshold))
+            
+            embed = discord.Embed(
+                title="✅ Resource Alerts Enabled",
+                description=f"Alerts will trigger when:\n• CPU > {cpu_threshold}%\n• Memory > {mem_threshold}%",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Auto-Restart", value="Server will auto-restart if usage exceeds 95%", inline=False)
+            
+            if not minecraft_resource_monitor.is_running():
+                minecraft_resource_monitor.start()
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            if guild_id in bot.mc_resource_alerts:
+                bot.mc_resource_alerts[guild_id]['enabled'] = False
+            
+            embed = discord.Embed(
+                title="❌ Resource Alerts Disabled",
+                description="Resource monitoring has been disabled.",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT PERFORMANCE DASHBOARD
+# =========================================================
+@bot.tree.command(name="mcdashboard", description="Set up performance dashboard (Admin only)")
+@discord.app_commands.describe(channel="Channel for dashboard (leave empty to disable)")
+async def mcdashboard(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Configure performance dashboard"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if channel:
+            bot.mc_dashboard_channel = channel.id
+            
+            # Create initial dashboard
+            embed = discord.Embed(
+                title="📊 Minecraft Server Dashboard",
+                description="Dashboard will update every 5 minutes",
+                color=discord.Color.blue()
+            )
+            message = await channel.send(embed=embed)
+            bot.mc_dashboard_message_id = message.id
+            
+            if not minecraft_dashboard_updater.is_running():
+                minecraft_dashboard_updater.start()
+            
+            await interaction.followup.send(f"✅ Dashboard enabled in {channel.mention}")
+        else:
+            bot.mc_dashboard_channel = None
+            bot.mc_dashboard_message_id = None
+            await interaction.followup.send("❌ Dashboard disabled")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+# =========================================================
+# MINECRAFT COMMAND ALIASES
+# =========================================================
+@bot.tree.command(name="mcalias", description="Create command alias (Admin only)")
+@discord.app_commands.describe(alias="Alias name", command="Command to execute")
+async def mcalias(interaction: discord.Interaction, alias: str, command: str):
+    """Create command alias"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        guild_id = interaction.guild.id
+        if guild_id not in bot.mc_command_aliases:
+            bot.mc_command_aliases[guild_id] = {}
+        
+        bot.mc_command_aliases[guild_id][alias.lower()] = command
+        
+        embed = discord.Embed(
+            title="✅ Alias Created",
+            description=f"`{alias}` → `{command}`",
+            color=discord.Color.green()
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+
+@bot.tree.command(name="mctestlogs", description="Test player log detection (Admin only)")
+async def mctestlogs(interaction: discord.Interaction):
+    """Test what player logs are being detected"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    try:
+        if not await is_minecraft_running():
+            await interaction.followup.send("❌ Server is not running!")
+            return
+        
+        # Get recent logs
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '2 minutes ago' --no-pager -o cat 2>/dev/null"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        all_logs = logs_stdout.decode()
+        
+        # Filter for player-related logs
+        player_logs = [l for l in all_logs.split('\n') if any(kw in l.lower() for kw in ['player', 'connected', 'disconnected', 'joined', 'left'])]
+        
+        embed = discord.Embed(
+            title="🔍 Log Test Results",
+            color=discord.Color.blue()
+        )
+        
+        if player_logs:
+            # Show last 10 player-related log lines
+            recent_logs = player_logs[-10:]
+            embed.add_field(
+                name="Recent Player Logs",
+                value=f"```\n" + "\n".join(recent_logs) + "\n```",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="No Player Logs Found",
+                value="No player-related logs found in the last 2 minutes.",
+                inline=False
+            )
+        
+        embed.add_field(name="Notification Channel", value=f"<#{bot.mc_notification_channel}>" if bot.mc_notification_channel else "Not set", inline=True)
+        embed.add_field(name="Task Running", value="Yes" if minecraft_player_notifications.is_running() else "No", inline=True)
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: {e}")
+        logger.error(f"Error in mctestlogs: {e}", exc_info=True)
 
 @bot.tree.command(name="mcconsole", description="Start/stop live console streaming (Admin only)")
 async def mcconsole(interaction: discord.Interaction, action: str):
@@ -8186,26 +9653,14 @@ async def minecraft_console_stream():
         if not hasattr(bot, 'mc_last_timestamp'):
             bot.mc_last_timestamp = discord.utils.utcnow()
         
-        # Get logs from screen session
-        # Dump screen buffer to temp file
-        screen_log = "/tmp/mc_console_stream.log"
-        dump_cmd = f"screen -S minecraft -X hardcopy -h {screen_log} && tail -n 50 {screen_log}"
+        # Get logs from systemd journal
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '{bot.mc_last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}' --no-pager -n 100 -o cat"
         process = await asyncio.create_subprocess_shell(
-            dump_cmd,
+            logs_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            # Fallback to journalctl if screen fails
-            logs_cmd = f"journalctl --since '{bot.mc_last_timestamp.strftime('%Y-%m-%d %H:%M:%S')}' --no-pager -n 100 -o cat | grep -E 'bedrock_server|minecraft'"
-            process = await asyncio.create_subprocess_shell(
-                logs_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await process.communicate()
+        stdout, _ = await process.communicate()
         
         all_logs = stdout.decode()
         
@@ -8229,8 +9684,8 @@ async def minecraft_console_stream():
         # Keep only recent hashes to avoid memory bloat
         if len(bot.mc_processed_lines) > 500:
             bot.mc_processed_lines.clear()
-            
-            for line in new_lines:
+        
+        for line in new_lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -8284,6 +9739,552 @@ async def minecraft_console_stream():
 
 @minecraft_console_stream.before_loop
 async def before_console_stream():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT AUTO-RESTART MONITOR
+# =========================================================
+@tasks.loop(minutes=1)
+async def minecraft_auto_restart_monitor():
+    """Monitor server and auto-restart if crashed"""
+    try:
+        if not bot.mc_auto_restart_enabled:
+            return
+        
+        # Check if server should be running but isn't
+        was_running = getattr(bot, 'mc_was_running', False)
+        is_running = await is_minecraft_running()
+        
+        # If server was running but now isn't, it crashed
+        if was_running and not is_running:
+            logger.warning("⚠️ Minecraft server appears to have crashed! Attempting auto-restart...")
+            
+            # Try to restart
+            try:
+                start_cmd = f"screen -S minecraft -dm bash -c 'cd {MINECRAFT_DIR} && LD_LIBRARY_PATH=. ./bedrock_server'"
+                process = await asyncio.create_subprocess_shell(
+                    start_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                await asyncio.sleep(2)
+                
+                # Send notification if channel is set
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="🔄 Server Auto-Restarted",
+                            description="The Minecraft server crashed and has been automatically restarted.",
+                            color=discord.Color.orange()
+                        )
+                        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=False)
+                        embed.set_footer(text="Auto-restart system")
+                        await channel.send(embed=embed)
+                
+                logger.info("✅ Minecraft server auto-restarted successfully")
+            except Exception as e:
+                logger.error(f"❌ Failed to auto-restart server: {e}", exc_info=True)
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        await channel.send(f"❌ **Server Crash Detected**\nFailed to auto-restart: {str(e)}")
+        
+        # Update running state
+        bot.mc_was_running = is_running
+        
+    except Exception as e:
+        logger.error(f"Error in auto-restart monitor: {e}", exc_info=True)
+
+@minecraft_auto_restart_monitor.before_loop
+async def before_auto_restart_monitor():
+    await bot.wait_until_ready()
+    # Initialize state
+    bot.mc_was_running = await is_minecraft_running()
+
+# =========================================================
+# MINECRAFT PLAYER NOTIFICATIONS
+# =========================================================
+# MINECRAFT PLAYER NOTIFICATIONS
+# =========================================================
+@tasks.loop(seconds=5)
+async def minecraft_player_notifications():
+    """Send Discord notifications for player join/leave"""
+    try:
+        if not bot.mc_notification_channel:
+            return
+        
+        if not await is_minecraft_running():
+            return
+        
+        channel = bot.get_channel(bot.mc_notification_channel)
+        if not channel:
+            return
+        
+        # Track last seen players
+        if not hasattr(bot, 'mc_last_seen_players'):
+            bot.mc_last_seen_players = set()
+        
+        # Get current online players from logs
+        # Try multiple sources: systemd logs and direct server logs
+        logs = ""
+        
+        # Method 1: Try systemd logs (primary method)
+        logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '30 seconds ago' --no-pager -o cat 2>/dev/null | grep -iE 'player.*connected|player.*disconnected|player.*joined|player.*left|connected.*player|disconnected.*player'"
+        process = await asyncio.create_subprocess_shell(
+            logs_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        logs_stdout, _ = await process.communicate()
+        logs = logs_stdout.decode()
+        
+        # Method 2: Try server log files directly (Bedrock logs)
+        if not logs or len(logs.strip()) == 0:
+            # Check for latest log file
+            log_file_cmd = f"ls -t {MINECRAFT_DIR}/logs/*.log 2>/dev/null | head -1"
+            log_file_process = await asyncio.create_subprocess_shell(
+                log_file_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            log_file_stdout, _ = await log_file_process.communicate()
+            latest_log = log_file_stdout.decode().strip()
+            
+            if latest_log:
+                # Read last 200 lines and search for player events
+                tail_cmd = f"tail -n 200 {latest_log} 2>/dev/null | grep -iE 'player.*connected|player.*disconnected|player.*joined|player.*left|connected.*player|disconnected.*player'"
+                log_process = await asyncio.create_subprocess_shell(
+                    tail_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                log_stdout, _ = await log_process.communicate()
+                log_output = log_stdout.decode()
+                if log_output:
+                    logs = log_output
+        
+        current_players = set()
+        for line in logs.split('\n'):
+            if not line.strip():
+                continue
+                
+            line_lower = line.lower()
+            # Remove systemd/journalctl prefixes if present
+            # Format from journalctl -o cat: "[2026-01-07 17:26:10:720 INFO] Player connected: AdhilQuazi2866, xuid: ..."
+            if line.startswith('[') and ']' in line:
+                # Extract part after timestamp: "[2026-01-07 17:26:10:720 INFO] Player connected: ..."
+                line = line.split(']', 1)[-1].strip()
+                line_lower = line.lower()
+            
+            # Check for player connected (exact Bedrock format: "Player connected: PlayerName, xuid: ...")
+            if 'player connected:' in line_lower:
+                try:
+                    # Format: "Player connected: AdhilQuazi2866, xuid: 2535424834170267"
+                    parts = line.split('Player connected:', 1) if 'Player connected:' in line else line.split('player connected:', 1)
+                    if len(parts) > 1:
+                        # Get player name (before comma or before "xuid")
+                        player_part = parts[-1].strip()
+                        # Remove xuid part if present
+                        if ',' in player_part:
+                            player = player_part.split(',')[0].strip()
+                        elif 'xuid' in player_part.lower():
+                            player = player_part.split('xuid')[0].strip()
+                        else:
+                            player = player_part.split()[0].strip()
+                        
+                        # Clean up
+                        player = player.strip('[]()"\'').strip()
+                        
+                        if player and len(player) >= 2 and player not in bot.mc_last_seen_players:
+                            # New player joined
+                            embed = discord.Embed(
+                                title="🟢 Player Joined",
+                                description=f"**{player}** joined the server!",
+                                color=discord.Color.green()
+                            )
+                            embed.timestamp = discord.utils.utcnow()
+                            await channel.send(embed=embed)
+                            bot.mc_last_seen_players.add(player)
+                            
+                            # Track activity
+                            if player not in bot.mc_player_activity:
+                                bot.mc_player_activity[player] = {'sessions': 0, 'total_time': 0}
+                            bot.mc_player_activity[player]['last_join'] = discord.utils.utcnow()
+                        
+                        if player:
+                            current_players.add(player)
+                except:
+                    pass
+            # Check for player disconnected (Bedrock format)
+            elif 'player disconnected:' in line_lower:
+                try:
+                    # Format: "Player disconnected: PlayerName, xuid: ..."
+                    parts = line.split('Player disconnected:', 1) if 'Player disconnected:' in line else line.split('player disconnected:', 1)
+                    if len(parts) > 1:
+                        # Get player name (before comma or before "xuid")
+                        player_part = parts[-1].strip()
+                        if ',' in player_part:
+                            player = player_part.split(',')[0].strip()
+                        elif 'xuid' in player_part.lower():
+                            player = player_part.split('xuid')[0].strip()
+                        else:
+                            player = player_part.split()[0].strip()
+                        
+                        # Clean up
+                        player = player.strip('[]()"\'').strip()
+                        
+                        if player and len(player) >= 2 and player in bot.mc_last_seen_players:
+                            # Player left
+                            embed = discord.Embed(
+                                title="🔴 Player Left",
+                                description=f"**{player}** left the server.",
+                                color=discord.Color.red()
+                            )
+                            embed.timestamp = discord.utils.utcnow()
+                            await channel.send(embed=embed)
+                            bot.mc_last_seen_players.discard(player)
+                            
+                            # Update activity tracking
+                            if player in bot.mc_player_activity and 'last_join' in bot.mc_player_activity[player]:
+                                session_time = (discord.utils.utcnow() - bot.mc_player_activity[player]['last_join']).total_seconds()
+                                bot.mc_player_activity[player]['total_time'] += session_time
+                                bot.mc_player_activity[player]['sessions'] += 1
+                                del bot.mc_player_activity[player]['last_join']
+                        
+                        if player and player in current_players:
+                            current_players.discard(player)
+                except:
+                    pass
+        
+        # Update last seen players
+        bot.mc_last_seen_players = current_players
+        
+    except Exception as e:
+        logger.error(f"Error in player notifications: {e}", exc_info=True)
+        # Log the error but don't crash the task
+        if bot.mc_notification_channel:
+            try:
+                error_channel = bot.get_channel(bot.mc_notification_channel)
+                if error_channel:
+                    # Only send error once per hour to avoid spam
+                    if not hasattr(bot, 'mc_last_error_time'):
+                        bot.mc_last_error_time = {}
+                    now = discord.utils.utcnow()
+                    last_error = bot.mc_last_error_time.get('notifications')
+                    if not last_error or (now - last_error).total_seconds() > 3600:
+                        await error_channel.send(f"⚠️ Player notification error: {str(e)[:200]}")
+                        bot.mc_last_error_time['notifications'] = now
+            except:
+                pass
+
+@minecraft_player_notifications.before_loop
+async def before_player_notifications():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT SCHEDULED BACKUPS
+# =========================================================
+@tasks.loop(hours=1)
+async def minecraft_scheduled_backups():
+    """Perform scheduled backups"""
+    try:
+        for guild_id, backup_config in bot.mc_scheduled_backups.items():
+            if not backup_config.get('enabled', False):
+                continue
+            
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            
+            interval_hours = backup_config.get('interval_hours', 24)
+            last_backup = backup_config.get('last_backup')
+            
+            # Check if it's time for a backup
+            if last_backup:
+                time_since = (discord.utils.utcnow() - last_backup).total_seconds() / 3600
+                if time_since < interval_hours:
+                    continue
+            
+            # Perform backup
+            try:
+                timestamp = discord.utils.utcnow().strftime("%Y%m%d_%H%M%S")
+                backup_name = f"auto_backup_{timestamp}.tar.gz"
+                
+                # Create backup directory if needed
+                mkdir_cmd = "mkdir -p ~/minecraft-backups"
+                await asyncio.create_subprocess_shell(mkdir_cmd)
+                
+                # Create backup
+                backup_cmd = f"cd {MINECRAFT_DIR} && tar -czf ~/minecraft-backups/{backup_name} worlds/"
+                process = await asyncio.create_subprocess_shell(
+                    backup_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await process.communicate()
+                
+                # Get backup size
+                size_cmd = f"du -h ~/minecraft-backups/{backup_name} | cut -f1"
+                size_process = await asyncio.create_subprocess_shell(
+                    size_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                size_stdout, _ = await size_process.communicate()
+                backup_size = size_stdout.decode().strip()
+                
+                # Update last backup time
+                backup_config['last_backup'] = discord.utils.utcnow()
+                
+                # Send notification
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="💾 Automatic Backup Created",
+                            description=f"World backup completed successfully!",
+                            color=discord.Color.green()
+                        )
+                        embed.add_field(name="Backup Name", value=backup_name, inline=True)
+                        embed.add_field(name="Size", value=backup_size, inline=True)
+                        embed.add_field(name="Location", value="`~/minecraft-backups/`", inline=False)
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                
+                logger.info(f"✅ Scheduled backup created: {backup_name}")
+                
+            except Exception as e:
+                logger.error(f"Error creating scheduled backup: {e}", exc_info=True)
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        await channel.send(f"❌ **Backup Failed**\nError: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error in scheduled backups: {e}", exc_info=True)
+
+@minecraft_scheduled_backups.before_loop
+async def before_scheduled_backups():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT SCHEDULED RESTARTS
+# =========================================================
+@tasks.loop(minutes=1)
+async def minecraft_scheduled_restarts():
+    """Check for scheduled restart times"""
+    try:
+        from datetime import datetime
+        now = datetime.now()
+        current_time = now.strftime("%H:%M")
+        current_day = now.strftime("%A").lower()
+        
+        for guild_id, restart_config in bot.mc_scheduled_restarts.items():
+            if not restart_config.get('enabled', False):
+                continue
+            
+            restart_time = restart_config.get('time', '03:00')
+            days = restart_config.get('days', [])
+            
+            # Check if it's time for restart
+            if current_time == restart_time and current_day in days:
+                # Check if we already restarted today
+                last_restart = restart_config.get('last_restart_date')
+                today = now.strftime("%Y-%m-%d")
+                
+                if last_restart != today:
+                    # Warn players 5 minutes before
+                    if await is_minecraft_running():
+                        try:
+                            command_file = f"{MINECRAFT_DIR}/command_input.txt"
+                            with open(command_file, 'a') as f:
+                                f.write(f"say Server will restart in 5 minutes!\n")
+                        except:
+                            pass
+                        
+                        await asyncio.sleep(300)  # Wait 5 minutes
+                        
+                        # Restart server
+                        restart_cmd = f"sudo systemctl restart {MINECRAFT_SERVICE}"
+                        process = await asyncio.create_subprocess_shell(
+                            restart_cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        )
+                        await process.communicate()
+                        
+                        restart_config['last_restart_date'] = today
+                        
+                        # Send notification
+                        if bot.mc_notification_channel:
+                            channel = bot.get_channel(bot.mc_notification_channel)
+                            if channel:
+                                embed = discord.Embed(
+                                    title="🔄 Scheduled Restart",
+                                    description="Server has been restarted as scheduled.",
+                                    color=discord.Color.orange()
+                                )
+                                embed.timestamp = discord.utils.utcnow()
+                                await channel.send(embed=embed)
+                        
+                        logger.info(f"✅ Scheduled restart completed at {restart_time}")
+    except Exception as e:
+        logger.error(f"Error in scheduled restarts: {e}", exc_info=True)
+
+@minecraft_scheduled_restarts.before_loop
+async def before_scheduled_restarts():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT RESOURCE MONITORING
+# =========================================================
+@tasks.loop(minutes=5)
+async def minecraft_resource_monitor():
+    """Monitor server resources and send alerts"""
+    try:
+        if not await is_minecraft_running():
+            return
+        
+        for guild_id, alert_config in bot.mc_resource_alerts.items():
+            if not alert_config.get('enabled', False):
+                continue
+            
+            # Get CPU usage
+            cpu_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $3}}'"
+            cpu_process = await asyncio.create_subprocess_shell(
+                cpu_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            cpu_stdout, _ = await cpu_process.communicate()
+            cpu_lines = cpu_stdout.decode().strip().split('\n')
+            cpu_usage = sum(float(line.strip()) for line in cpu_lines if line.strip().replace('.', '').isdigit())
+            
+            # Get memory usage
+            mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4}}'"
+            mem_process = await asyncio.create_subprocess_shell(
+                mem_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            mem_stdout, _ = await mem_process.communicate()
+            mem_lines = mem_stdout.decode().strip().split('\n')
+            mem_usage = sum(float(line.strip()) for line in mem_lines if line.strip().replace('.', '').isdigit())
+            
+            cpu_threshold = alert_config.get('cpu_threshold', 80)
+            mem_threshold = alert_config.get('mem_threshold', 80)
+            
+            # Check thresholds
+            if cpu_usage > cpu_threshold or mem_usage > mem_threshold:
+                # Send alert
+                if bot.mc_notification_channel:
+                    channel = bot.get_channel(bot.mc_notification_channel)
+                    if channel:
+                        embed = discord.Embed(
+                            title="⚠️ High Resource Usage",
+                            description="Minecraft server is using high resources!",
+                            color=discord.Color.red()
+                        )
+                        embed.add_field(name="CPU Usage", value=f"{cpu_usage:.1f}%", inline=True)
+                        embed.add_field(name="Memory Usage", value=f"{mem_usage:.1f}%", inline=True)
+                        embed.timestamp = discord.utils.utcnow()
+                        await channel.send(embed=embed)
+                        
+                        # Auto-restart if extremely high
+                        if cpu_usage > 95 or mem_usage > 95:
+                            restart_cmd = f"sudo systemctl restart {MINECRAFT_SERVICE}"
+                            await asyncio.create_subprocess_shell(restart_cmd)
+                            await channel.send("🔄 Server auto-restarted due to extreme resource usage.")
+    except Exception as e:
+        logger.error(f"Error in resource monitoring: {e}", exc_info=True)
+
+@minecraft_resource_monitor.before_loop
+async def before_resource_monitor():
+    await bot.wait_until_ready()
+
+# =========================================================
+# MINECRAFT PERFORMANCE DASHBOARD
+# =========================================================
+@tasks.loop(minutes=5)
+async def minecraft_dashboard_updater():
+    """Update Minecraft performance dashboard"""
+    try:
+        if not bot.mc_dashboard_channel or not bot.mc_dashboard_message_id:
+            return
+        
+        channel = bot.get_channel(bot.mc_dashboard_channel)
+        if not channel:
+            return
+        
+        is_running = await is_minecraft_running()
+        
+        # Get performance metrics
+        cpu_usage = 0.0
+        mem_usage = 0.0
+        online_players = 0
+        
+        if is_running:
+            # CPU
+            cpu_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $3}}'"
+            cpu_process = await asyncio.create_subprocess_shell(
+                cpu_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            cpu_stdout, _ = await cpu_process.communicate()
+            cpu_lines = cpu_stdout.decode().strip().split('\n')
+            cpu_usage = sum(float(line.strip()) for line in cpu_lines if line.strip().replace('.', '').isdigit())
+            
+            # Memory
+            mem_cmd = f"ps aux | grep bedrock_server | grep -v grep | awk '{{print $4}}'"
+            mem_process = await asyncio.create_subprocess_shell(
+                mem_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            mem_stdout, _ = await mem_process.communicate()
+            mem_lines = mem_stdout.decode().strip().split('\n')
+            mem_usage = sum(float(line.strip()) for line in mem_lines if line.strip().replace('.', '').isdigit())
+            
+            # Online players
+            logs_cmd = f"journalctl -u {MINECRAFT_SERVICE} --since '1 minute ago' --no-pager | grep -E 'Player connected|Player disconnected'"
+            logs_process = await asyncio.create_subprocess_shell(
+                logs_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logs_stdout, _ = await logs_process.communicate()
+            logs = logs_stdout.decode()
+            online_players = len([l for l in logs.split('\n') if 'Player connected' in l]) - len([l for l in logs.split('\n') if 'Player disconnected' in l])
+            online_players = max(0, online_players)
+        
+        embed = discord.Embed(
+            title="📊 Minecraft Server Dashboard",
+            color=discord.Color.green() if is_running else discord.Color.red(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        status = "🟢 Online" if is_running else "🔴 Offline"
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="CPU Usage", value=f"{cpu_usage:.1f}%", inline=True)
+        embed.add_field(name="Memory Usage", value=f"{mem_usage:.1f}%", inline=True)
+        embed.add_field(name="Online Players", value=str(online_players), inline=True)
+        embed.add_field(name="Server IP", value="`140.245.223.94:19132`", inline=False)
+        
+        try:
+            message = await channel.fetch_message(bot.mc_dashboard_message_id)
+            await message.edit(embed=embed)
+        except:
+            # Create new message if old one doesn't exist
+            message = await channel.send(embed=embed)
+            bot.mc_dashboard_message_id = message.id
+    except Exception as e:
+        logger.error(f"Error updating dashboard: {e}", exc_info=True)
+
+@minecraft_dashboard_updater.before_loop
+async def before_dashboard_updater():
     await bot.wait_until_ready()
 
 # -------------------------

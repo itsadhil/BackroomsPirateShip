@@ -1,0 +1,21 @@
+[Unit]
+Description=Minecraft Bedrock Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/minecraft-bedrock
+Environment="LD_LIBRARY_PATH=/home/ubuntu/minecraft-bedrock"
+ExecStart=/home/ubuntu/minecraft-bedrock/bedrock_server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits (adjust as needed)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+

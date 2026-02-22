@@ -50,6 +50,27 @@ class Settings:
     INSTAGRAM_USERNAME: str = os.getenv("INSTAGRAM_USERNAME", "")
     INSTAGRAM_PASSWORD: str = os.getenv("INSTAGRAM_PASSWORD", "")
 
+    # AI Assistant
+    AI_ENABLED: bool = os.getenv("AI_ENABLED", "true").lower() == "true"
+    # Try to get API key - prioritize based on provider, but try all
+    _groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    _openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    _anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    _provider = os.getenv("AI_PROVIDER", "groq").lower()
+
+    # Get key based on provider preference
+    if _provider == "groq" and _groq_key:
+        AI_API_KEY: str = _groq_key
+    elif _provider == "openai" and _openai_key:
+        AI_API_KEY: str = _openai_key
+    elif _provider == "anthropic" and _anthropic_key:
+        AI_API_KEY: str = _anthropic_key
+    else:
+        # Fallback: use any available key
+        AI_API_KEY: str = _groq_key or _openai_key or _anthropic_key
+
+    AI_PROVIDER: str = _provider  # openai, groq, anthropic (default to groq)
+    AI_MODEL: str = os.getenv("AI_MODEL", "").strip()  # Optional: override default model
     # Data files
     DATA_DIR: Path = Path("data")
     RSS_SEEN_FILE: Path = DATA_DIR / "fitgirl_seen_posts.json"
